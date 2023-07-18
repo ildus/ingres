@@ -1,0 +1,10 @@
+prefix=II_SYSTEM/ingres
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/files
+
+Name: Ingres OpenAPI
+Description: API for Ingres (Vector) DBMS
+Version: 11
+Cflags: -I${includedir}
+Libs: -L/${libdir} -lingres -lpthread -lrt -lm -lc -l:libcrypt.so.1 -ldl -lgcc_s -lstdc++

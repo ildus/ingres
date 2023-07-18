@@ -1,0 +1,4 @@
+set tabstop=4
+set expandtab
+
+autocmd FileType make setlocal noexpandtab
