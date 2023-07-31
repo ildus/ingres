@@ -23,6 +23,8 @@ import (
 	"log"
 	"reflect"
 	"time"
+
+	"database/sql/driver"
 )
 
 type OpenAPIEnv struct {
@@ -56,10 +58,19 @@ type columnDesc struct {
 	scale       int16
 }
 
-type QueryResult struct {
+type rowsHeader struct {
+	colNames []string
+	colTyps  []columnDesc
+}
+
+type rows struct {
 	transHandle C.II_PTR
 	stmtHandle  C.II_PTR
-	columns     []columnDesc
+
+	finish func()
+	rowsHeader
+	done   bool
+	result driver.Result
 }
 
 func InitOpenAPI() (*OpenAPIEnv, error) {
@@ -111,9 +122,9 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 
 	if connParm.co_genParm.gp_status == C.IIAPI_ST_SUCCESS {
 		return &OpenAPIConn{
-            env: env,
-            handle: connParm.co_connHandle,
-        }, nil
+			env:    env,
+			handle: connParm.co_connHandle,
+		}, nil
 	}
 
 	if connParm.co_connHandle != nil {
@@ -189,7 +200,7 @@ func (c *OpenAPIConn) AutoCommit() error {
 		return err
 	}
 
-    c.AutoCommitTransation = OpenAPITransaction{conn: c, handle: handle}
+	c.AutoCommitTransation = OpenAPITransaction{conn: c, handle: handle}
 	return nil
 }
 
@@ -220,7 +231,7 @@ func Wait(genParm *C.IIAPI_GENPARM) {
 	}
 }
 
-func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*QueryResult, error) {
+func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, error) {
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
 	//var getColParm C.IIAPI_GETCOLPARM
@@ -244,7 +255,7 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*QueryRe
 		return nil, err
 	}
 
-	res := &QueryResult{
+	res := &rows{
 		transHandle: queryParm.qy_tranHandle,
 		stmtHandle:  queryParm.qy_stmtHandle,
 	}
@@ -264,35 +275,63 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*QueryRe
 		return nil, err
 	}
 
-	res.columns = make([]columnDesc, getDescrParm.gd_descriptorCount)
+	res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
+	res.colNames = make([]string, getDescrParm.gd_descriptorCount)
 
-	for i := 0; i < len(res.columns); i++ {
+	for i := 0; i < len(res.colTyps); i++ {
 		descr := C.get_descr(&getDescrParm, C.ulong(i))
-		res.columns[i].ingDataType = descr.ds_dataType
-		res.columns[i].nullable = (descr.ds_nullable == 1)
-		res.columns[i].length = uint16(descr.ds_length)
-		res.columns[i].precision = int16(descr.ds_precision)
-		res.columns[i].scale = int16(descr.ds_scale)
-		res.columns[i].name = C.GoString(descr.ds_columnName)
+		res.colTyps[i].ingDataType = descr.ds_dataType
+		res.colTyps[i].nullable = (descr.ds_nullable == 1)
+		res.colTyps[i].length = uint16(descr.ds_length)
+		res.colTyps[i].precision = int16(descr.ds_precision)
+		res.colTyps[i].scale = int16(descr.ds_scale)
+
+		res.colNames[i] = C.GoString(descr.ds_columnName)
 	}
 
 	return res, nil
 }
 
-func (qr *QueryResult) Close() error {
+func closeTransaction(tranHandle C.II_PTR) error {
+	var rollbackParm C.IIAPI_ROLLBACKPARM
+
+	rollbackParm.rb_genParm.gp_callback = nil
+	rollbackParm.rb_genParm.gp_closure = nil
+	rollbackParm.rb_tranHandle = tranHandle
+	rollbackParm.rb_savePointHandle = nil
+
+	C.IIapi_rollback(&rollbackParm)
+	Wait(&rollbackParm.rb_genParm)
+	return checkError("IIapi_rollback", &rollbackParm.rb_genParm)
+}
+
+func (rs *rows) Close() error {
+	if finish := rs.finish; finish != nil {
+		defer finish()
+	}
+
 	var closeParm C.IIAPI_CLOSEPARM
 
 	closeParm.cl_genParm.gp_callback = nil
 	closeParm.cl_genParm.gp_closure = nil
-	closeParm.cl_stmtHandle = qr.stmtHandle
+	closeParm.cl_stmtHandle = rs.stmtHandle
 
 	C.IIapi_close(&closeParm)
 	Wait(&closeParm.cl_genParm)
-	return checkError("IIapi_close()", &closeParm.cl_genParm)
+	err := checkError("IIapi_close()", &closeParm.cl_genParm)
+
+    if rs.transHandle != nil {
+        rollbackErr := closeTransaction(rs.transHandle)
+        if rollbackErr != nil {
+            return rollbackErr
+        }
+    }
+
+	return err
 }
 
-func (c *OpenAPIConn) Query(queryStr string) (*QueryResult, error) {
-	return query(c.handle, c.AutoCommitTransation.handle, queryStr)
+func (c *OpenAPIConn) Fetch(queryStr string) (*rows, error) {
+	return query(c.handle, nil, queryStr)
 }
 
 func checkError(location string, genParm *C.IIAPI_GENPARM) error {
@@ -356,14 +395,16 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 			errText := fmt.Sprintf("Type:%s State:%s Code:0x%x Message:%s",
 				desc, getErrParm.ge_SQLSTATE, getErrParm.ge_errorCode, msg)
 
-			log.Printf("OpenAPI error: %s\n", errText)
-
 			if err != nil {
 				err = fmt.Errorf("%w\n%s", err, errText)
 			} else {
 				err = fmt.Errorf(errText)
 			}
 		}
+	}
+
+	if err != nil {
+		log.Printf("%v\n", err)
 	}
 
 	return err
@@ -376,24 +417,31 @@ func (c *columnDesc) getType() reflect.Type {
 		C.IIAPI_CHA_TYPE,
 		C.IIAPI_VCH_TYPE,
 		C.IIAPI_LVCH_TYPE,
-		C.IIAPI_LCLOC_TYPE,
 		C.IIAPI_NCHA_TYPE,
 		C.IIAPI_NVCH_TYPE,
 		C.IIAPI_LNVCH_TYPE,
-		C.IIAPI_LNLOC_TYPE,
 		C.IIAPI_TXT_TYPE,
 		C.IIAPI_LTXT_TYPE:
 		return reflect.TypeOf("")
 	case
 		C.IIAPI_BYTE_TYPE,
 		C.IIAPI_VBYTE_TYPE,
-		C.IIAPI_LBYTE_TYPE,
-		C.IIAPI_LBLOC_TYPE:
+		C.IIAPI_LBYTE_TYPE:
 		return reflect.TypeOf([]byte(nil))
 	case C.IIAPI_INT_TYPE:
-		return reflect.TypeOf(int64(0))
+		if c.length == 2 {
+			return reflect.TypeOf(int16(0))
+		} else if c.length == 4 {
+			return reflect.TypeOf(int32(0))
+		} else if c.length == 8 {
+			return reflect.TypeOf(int32(0))
+		}
 	case C.IIAPI_FLT_TYPE:
-		return reflect.TypeOf(float64(0))
+		if c.length == 4 {
+			return reflect.TypeOf(float32(0))
+		} else if c.length == 8 {
+			return reflect.TypeOf(float64(0))
+		}
 	case
 		C.IIAPI_MNY_TYPE, /* Money */
 		C.IIAPI_DEC_TYPE: /* Decimal */
@@ -419,7 +467,97 @@ func (c *columnDesc) getType() reflect.Type {
 	case C.IIAPI_INTYM_TYPE, /* Interval Year to Month */
 		C.IIAPI_INTDS_TYPE: /* Interval Day to Second */
 		return reflect.TypeOf(time.Duration(0))
-	default:
-		return reflect.TypeOf([]byte(nil))
 	}
+	return reflect.TypeOf([]byte(nil))
+}
+
+var ingresTypes = map[C.IIAPI_DT_ID]string{
+	C.IIAPI_CHR_TYPE:   "c",
+	C.IIAPI_CHA_TYPE:   "char",
+	C.IIAPI_VCH_TYPE:   "varchar",
+	C.IIAPI_LVCH_TYPE:  "long varchar",
+	C.IIAPI_LCLOC_TYPE: "long char locator",
+	C.IIAPI_NCHA_TYPE:  "nchar",
+	C.IIAPI_NVCH_TYPE:  "nvarchar",
+	C.IIAPI_LNVCH_TYPE: "long nvarchar",
+	C.IIAPI_TXT_TYPE:   "text",
+	C.IIAPI_LTXT_TYPE:  "long text",
+	C.IIAPI_BYTE_TYPE:  "byte",
+	C.IIAPI_VBYTE_TYPE: "varbyte",
+	C.IIAPI_LBYTE_TYPE: "long byte",
+	C.IIAPI_LBLOC_TYPE: "long byte locator",
+	C.IIAPI_MNY_TYPE:   "money",
+	C.IIAPI_DEC_TYPE:   "decimal",
+	C.IIAPI_BOOL_TYPE:  "boolean",
+	C.IIAPI_UUID_TYPE:  "UUID",
+	C.IIAPI_IPV4_TYPE:  "IPV4",
+	C.IIAPI_IPV6_TYPE:  "IPV6",
+	C.IIAPI_DTE_TYPE:   "ingresdate",
+	C.IIAPI_DATE_TYPE:  "ansidate",
+	C.IIAPI_TIME_TYPE:  "time with local time zone",
+	C.IIAPI_TMWO_TYPE:  "time without time zone",
+	C.IIAPI_TMTZ_TYPE:  "time with time zone",
+	C.IIAPI_TS_TYPE:    "timestamp with local time zone",
+	C.IIAPI_TSWO_TYPE:  "timestamp without time zone",
+	C.IIAPI_TSTZ_TYPE:  "timestamp with time zone",
+	C.IIAPI_INTYM_TYPE: "interval year to month",
+	C.IIAPI_INTDS_TYPE: "interval day to second",
+}
+
+func (c *columnDesc) getTypeName() string {
+	val, ok := ingresTypes[c.ingDataType]
+
+	if !ok {
+		if c.ingDataType == C.IIAPI_INT_TYPE {
+			switch c.length {
+			case 1:
+				return "integer1"
+			case 2:
+				return "integer2"
+			case 4:
+				return "integer4"
+			case 8:
+				return "integer8"
+			}
+		} else if c.ingDataType == C.IIAPI_FLT_TYPE {
+			switch c.length {
+			case 4:
+				return "float4"
+			case 8:
+				return "float8"
+			}
+		}
+
+		return "UNKNOWN"
+	}
+
+	return val
+}
+
+func (c *columnDesc) isDecimal() bool {
+	return c.ingDataType == C.IIAPI_DEC_TYPE
+}
+
+var varTypes = map[C.IIAPI_DT_ID]int64{
+	C.IIAPI_VCH_TYPE:   -1, // use length
+	C.IIAPI_LVCH_TYPE:  2_000_000_000,
+	C.IIAPI_NVCH_TYPE:  -1, // use length
+	C.IIAPI_LNVCH_TYPE: 1_000_000_000,
+	C.IIAPI_TXT_TYPE:   -1, // use length
+	C.IIAPI_LTXT_TYPE:  -1, // use length
+	C.IIAPI_VBYTE_TYPE: -1, // use length
+	C.IIAPI_LBYTE_TYPE: 2_000_000_000,
+}
+
+func (c *columnDesc) Length() (int64, bool) {
+	val, ok := varTypes[c.ingDataType]
+	if !ok {
+		return 0, false
+	}
+
+	if val == -1 {
+		return int64(c.length), true
+	}
+
+	return val, true
 }

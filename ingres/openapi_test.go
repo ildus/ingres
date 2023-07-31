@@ -36,7 +36,8 @@ func TestQuery(t *testing.T) {
     require.Equal(t, err, nil)
 	defer conn.Disconnect()
 
-    qr, err := conn.Query("select table_name from iitables")
+    rows, err := conn.Fetch("select table_name from iitables")
     require.Equal(t, err, nil)
-    defer qr.Close()
+    require.Equal(t, rows.colNames[0], "table_name")
+    defer rows.Close()
 }
