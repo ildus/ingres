@@ -43,6 +43,10 @@ func (rs *rows) ColumnTypeLength(index int) (length int64, ok bool) {
 	return rs.colTyps[index].Length()
 }
 
+func (rs *rows) ColumnTypeNullable(index int) (nullable bool, ok bool) {
+	return rs.colTyps[index].nullable, true
+}
+
 // ColumnTypePrecisionScale should return the precision and scale for decimal
 // types. If not applicable, ok should be false.
 func (rs *rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
@@ -63,4 +67,12 @@ func (rs *rows) Result() driver.Result {
 	}
 
 	return rs.result
+}
+
+func (rs rows) LastInsertId() (int64, error) {
+    return rs.lastInsertId, nil
+}
+
+func (rs rows) RowsAffected() (int64, error) {
+	return rs.rowsAffected, nil
 }

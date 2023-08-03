@@ -3,6 +3,10 @@ package ingres
 import (
 	"testing"
     "github.com/stretchr/testify/require"
+    "log"
+    "io"
+
+	"database/sql/driver"
 )
 
 func TestInitOpenAPI(t *testing.T) {
@@ -36,8 +40,18 @@ func TestQuery(t *testing.T) {
     require.Equal(t, err, nil)
 	defer conn.Disconnect()
 
-    rows, err := conn.Fetch("select table_name from iitables")
+    rows, err := conn.Fetch("select reltid, relid from iirelation limit 5")
     require.Equal(t, err, nil)
-    require.Equal(t, rows.colNames[0], "table_name")
+    require.Equal(t, rows.colNames[0], "reltid")
+    require.Equal(t, rows.colNames[1], "relid")
     defer rows.Close()
+
+    for {
+        var dest = make([]driver.Value, len(rows.colNames))
+        if rows.Next(dest) == io.EOF {
+            break
+        }
+
+        log.Println(dest)
+    }
 }

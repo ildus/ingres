@@ -9,8 +9,19 @@ package ingres
 IIAPI_INITPARM InitParm = {0, IIAPI_VERSION, 0, NULL};
 
 // golang doesn't support C array, use this to get descriptor item
-static inline IIAPI_DESCRIPTOR * get_descr(IIAPI_GETDESCRPARM *descrParm, size_t i) {
+static inline IIAPI_DESCRIPTOR * get_descr(IIAPI_GETDESCRPARM *descrParm, size_t i)
+{
     return &descrParm->gd_descriptor[i];
+}
+
+static inline IIAPI_DATAVALUE * allocate_cols(short len)
+{
+    return malloc(sizeof(IIAPI_DATAVALUE) * len);
+}
+
+static inline void set_dv_value(IIAPI_DATAVALUE *dest, int i, void *val)
+{
+    dest[i].dv_value = val;
 }
 
 //common/aif/demo/apiautil.c
@@ -18,11 +29,16 @@ static inline IIAPI_DESCRIPTOR * get_descr(IIAPI_GETDESCRPARM *descrParm, size_t
 */
 import "C"
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"reflect"
+	"sync"
 	"time"
+	"unsafe"
 
 	"database/sql/driver"
 )
@@ -71,6 +87,37 @@ type rows struct {
 	rowsHeader
 	done   bool
 	result driver.Result
+
+	cols *C.IIAPI_DATAVALUE
+	vals [][]byte
+
+	lastInsertId int64
+	rowsAffected int64
+
+	getColParm C.IIAPI_GETCOLPARM
+}
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+var nativeEndian binary.ByteOrder
+var _ driver.Result = rows{}
+
+func init() {
+    buf := [2]byte{}
+    *(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
+
+    switch buf {
+    case [2]byte{0xCD, 0xAB}:
+        nativeEndian = binary.LittleEndian
+    case [2]byte{0xAB, 0xCD}:
+        nativeEndian = binary.BigEndian
+    default:
+        panic("Could not determine native endianness.")
+    }
 }
 
 func InitOpenAPI() (*OpenAPIEnv, error) {
@@ -234,9 +281,6 @@ func Wait(genParm *C.IIAPI_GENPARM) {
 func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, error) {
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
-	//var getColParm C.IIAPI_GETCOLPARM
-	//var getQInfoParm C.IIAPI_GETQINFOPARM
-	//var closeParm C.IIAPI_CLOSEPARM
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
@@ -277,6 +321,8 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, e
 
 	res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
 	res.colNames = make([]string, getDescrParm.gd_descriptorCount)
+	res.cols = C.allocate_cols(getDescrParm.gd_descriptorCount)
+	res.vals = make([][]byte, len(res.colTyps))
 
 	for i := 0; i < len(res.colTyps); i++ {
 		descr := C.get_descr(&getDescrParm, C.ulong(i))
@@ -287,7 +333,16 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, e
 		res.colTyps[i].scale = int16(descr.ds_scale)
 
 		res.colNames[i] = C.GoString(descr.ds_columnName)
+		res.vals[i] = make([]byte, res.colTyps[i].length)
+		C.set_dv_value(res.cols, C.int(i), unsafe.Pointer(&res.vals[i][0]))
 	}
+	res.getColParm.gc_genParm.gp_callback = nil
+	res.getColParm.gc_genParm.gp_closure = nil
+	res.getColParm.gc_rowCount = 1
+	res.getColParm.gc_columnCount = getDescrParm.gd_descriptorCount
+	res.getColParm.gc_columnData = res.cols
+	res.getColParm.gc_stmtHandle = res.stmtHandle
+	res.getColParm.gc_moreSegments = 0
 
 	return res, nil
 }
@@ -303,31 +358,6 @@ func closeTransaction(tranHandle C.II_PTR) error {
 	C.IIapi_rollback(&rollbackParm)
 	Wait(&rollbackParm.rb_genParm)
 	return checkError("IIapi_rollback", &rollbackParm.rb_genParm)
-}
-
-func (rs *rows) Close() error {
-	if finish := rs.finish; finish != nil {
-		defer finish()
-	}
-
-	var closeParm C.IIAPI_CLOSEPARM
-
-	closeParm.cl_genParm.gp_callback = nil
-	closeParm.cl_genParm.gp_closure = nil
-	closeParm.cl_stmtHandle = rs.stmtHandle
-
-	C.IIapi_close(&closeParm)
-	Wait(&closeParm.cl_genParm)
-	err := checkError("IIapi_close()", &closeParm.cl_genParm)
-
-    if rs.transHandle != nil {
-        rollbackErr := closeTransaction(rs.transHandle)
-        if rollbackErr != nil {
-            return rollbackErr
-        }
-    }
-
-	return err
 }
 
 func (c *OpenAPIConn) Fetch(queryStr string) (*rows, error) {
@@ -560,4 +590,103 @@ func (c *columnDesc) Length() (int64, bool) {
 	}
 
 	return val, true
+}
+
+func (rs *rows) Close() error {
+	if finish := rs.finish; finish != nil {
+		defer finish()
+	}
+
+	var closeParm C.IIAPI_CLOSEPARM
+
+	closeParm.cl_genParm.gp_callback = nil
+	closeParm.cl_genParm.gp_closure = nil
+	closeParm.cl_stmtHandle = rs.stmtHandle
+
+	C.IIapi_close(&closeParm)
+	Wait(&closeParm.cl_genParm)
+	err := checkError("IIapi_close()", &closeParm.cl_genParm)
+
+	if rs.transHandle != nil {
+		rollbackErr := closeTransaction(rs.transHandle)
+		if rollbackErr != nil {
+			return rollbackErr
+		}
+	}
+
+	if rs.cols != nil {
+		C.free(unsafe.Pointer(rs.cols))
+	}
+
+	return err
+}
+
+func (rs *rows) fetchData() error {
+	var getQInfoParm C.IIAPI_GETQINFOPARM
+	var err error
+
+	C.IIapi_getColumns(&rs.getColParm)
+	Wait(&rs.getColParm.gc_genParm)
+	err = checkError("IIapi_getColumns()", &rs.getColParm.gc_genParm)
+	if err != nil {
+		return err
+	}
+
+	if rs.getColParm.gc_genParm.gp_status == C.IIAPI_ST_NO_DATA {
+		rs.done = true
+	}
+
+	if rs.done {
+		/* Get fetch result info */
+		getQInfoParm.gq_genParm.gp_callback = nil
+		getQInfoParm.gq_genParm.gp_closure = nil
+		getQInfoParm.gq_stmtHandle = rs.stmtHandle
+
+		C.IIapi_getQueryInfo(&getQInfoParm)
+		Wait(&getQInfoParm.gq_genParm)
+		err = checkError("IIapi_getQueryInfo()", &getQInfoParm.gq_genParm)
+	}
+
+	return err
+}
+
+func decode(col *columnDesc, val []byte) (driver.Value, error) {
+	var res driver.Value
+	switch col.ingDataType {
+	case C.IIAPI_INT_TYPE:
+		switch col.length {
+		case 1:
+			res = int8(val[0])
+		case 2:
+			res = int16(nativeEndian.Uint16(val))
+		case 4:
+			res = int32(nativeEndian.Uint32(val))
+		case 8:
+			res = int64(nativeEndian.Uint64(val))
+		}
+	case C.IIAPI_CHR_TYPE:
+		fallthrough
+	case C.IIAPI_CHA_TYPE:
+		fallthrough
+	case C.IIAPI_VCH_TYPE:
+		res = string(val)
+	}
+	return res, nil
+}
+
+func (rs *rows) Next(dest []driver.Value) (err error) {
+	rs.fetchData()
+
+	if rs.done {
+		return io.EOF
+	}
+
+	for i, val := range rs.vals {
+		dest[i], err = decode(&rs.colTyps[i], val)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
