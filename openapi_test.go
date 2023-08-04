@@ -24,7 +24,7 @@ func TestConnect(t *testing.T) {
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
 	require.Equal(t, err, nil)
-	defer conn.Disconnect()
+	defer conn.Close()
 
 	err = conn.AutoCommit()
 	require.Equal(t, err, nil)
@@ -40,16 +40,16 @@ func TestManyRows(t *testing.T) {
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
 	require.Equal(t, err, nil)
-	defer conn.Disconnect()
+	defer conn.Close()
 
-	rows, err := conn.Fetch("select reltid, relid from iirelation limit 5")
+	rows, err := conn.Query("select reltid, relid from iirelation limit 5", nil)
 	require.Equal(t, err, nil)
-	assert.Equal(t, rows.colNames[0], "reltid")
-	assert.Equal(t, rows.colNames[1], "relid")
+	assert.Equal(t, rows.Columns()[0], "reltid")
+	assert.Equal(t, rows.Columns()[1], "relid")
 	defer rows.Close()
 
 	for {
-		var dest = make([]driver.Value, len(rows.colNames))
+		var dest = make([]driver.Value, len(rows.Columns()))
 		if rows.Next(dest) == io.EOF {
 			break
 		}
@@ -65,10 +65,10 @@ func TestHandleError(t *testing.T) {
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
 	require.Equal(t, err, nil)
-	defer conn.Disconnect()
+	defer conn.Close()
 
     // should be error
-	rows, err := conn.Fetch("select reltid, from iirelation")
+	rows, err := conn.Query("select reltid, from iirelation", nil)
 	assert.NotEqual(t, nil, err)
     assert.Contains(t, err.Error(), "Syntax error")
 	assert.Nil(t, rows)
@@ -86,7 +86,7 @@ func testconn(t *testing.T) (*OpenAPIConn, func()) {
     }
 
     return conn, func() {
-	    conn.Disconnect()
+	    conn.Close()
         ReleaseOpenAPI(env)
     }
 }
@@ -98,16 +98,16 @@ func TestExec(t *testing.T) {
     conn.AutoCommit()
     defer conn.DisableAutoCommit()
 
-	result, err := conn.Exec("create table if not exists test_table(a int)")
+	result, err := conn.Exec("create table if not exists test_table(a int)", nil)
 	require.Nil(t, err)
 
-	result, err = conn.Exec("insert into test_table values (1), (2)")
+	result, err = conn.Exec("insert into test_table values (1), (2)", nil)
 	require.Nil(t, err)
 
     count, _ := result.RowsAffected()
     assert.Equal(t, 2, count)
 
-	result, err = conn.Exec("drop table test_table")
+	result, err = conn.Exec("drop table test_table", nil)
 	require.Nil(t, err)
 }
 
@@ -118,21 +118,21 @@ func TestDecode(t *testing.T) {
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
 	require.Equal(t, err, nil)
-	defer conn.Disconnect()
+	defer conn.Close()
 
-	rows, err := conn.Fetch(`select
+	rows, err := conn.Query(`select
             int1(10), int2(11),int4(12), int8(13),
             float4(1.1), float8(10.1),
             true, false,
             c('a'), char('b'), varchar('c'), text('d'),
             byte('aa'), varbyte('bb'),
             nchar('aaa'), nvarchar('bbb')
-        from iirelation limit 5`)
+        from iirelation limit 5`, nil)
 
 	require.Equal(t, err, nil)
 	defer rows.Close()
 
-	dest := make([]driver.Value, len(rows.colNames))
+	dest := make([]driver.Value, len(rows.Columns()))
 	rows.Next(dest)
 	assert.Equal(t, dest[0].(int8), int8(10))
 	assert.Equal(t, dest[1].(int16), int16(11))

@@ -41,7 +41,6 @@ import (
 	"time"
 	"unicode/utf16"
 	"unsafe"
-    "context"
 
 	"database/sql/driver"
 )
@@ -83,6 +82,7 @@ type rowsHeader struct {
 }
 
 type rows struct {
+	stmt             *stmt
 	transactionIsNew bool
 
 	transHandle C.II_PTR
@@ -173,7 +173,7 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 	}
 
 	C.IIapi_connect(&connParm)
-	Wait(&connParm.co_genParm)
+	wait(&connParm.co_genParm)
 	err := checkError("IIapi_connect()", &connParm.co_genParm)
 
 	if connParm.co_genParm.gp_status == C.IIAPI_ST_SUCCESS {
@@ -194,7 +194,7 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 		 ** Make sync request.
 		 */
 		C.IIapi_abort(&abortParm)
-		Wait(&abortParm.ab_genParm)
+		wait(&abortParm.ab_genParm)
 
 		abortErr := checkError("IIapi_abort()", &abortParm.ab_genParm)
 		if verbose && abortErr != nil {
@@ -209,7 +209,7 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 	return nil, err
 }
 
-func (c *OpenAPIConn) Disconnect() error {
+func disconnect(c *OpenAPIConn) error {
 	var disconnParm C.IIAPI_DISCONNPARM
 
 	disconnParm.dc_genParm.gp_callback = nil
@@ -217,7 +217,7 @@ func (c *OpenAPIConn) Disconnect() error {
 	disconnParm.dc_connHandle = c.handle
 
 	C.IIapi_disconnect(&disconnParm)
-	Wait(&disconnParm.dc_genParm)
+	wait(&disconnParm.dc_genParm)
 
 	// Check results.
 	err := checkError("IIapi_disconnect()", &disconnParm.dc_genParm)
@@ -233,7 +233,7 @@ func autoCommit(connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
 	autoParm.ac_tranHandle = transHandle
 
 	C.IIapi_autocommit(&autoParm)
-	Wait(&autoParm.ac_genParm)
+	wait(&autoParm.ac_genParm)
 
 	/*
 	 ** Check and return results.
@@ -273,7 +273,7 @@ func (c *OpenAPIConn) DisableAutoCommit() error {
 }
 
 // Wait a command to complete
-func Wait(genParm *C.IIAPI_GENPARM) {
+func wait(genParm *C.IIAPI_GENPARM) {
 	var waitParm C.IIAPI_WAITPARM
 
 	for genParm.gp_completed == 0 {
@@ -297,33 +297,37 @@ const (
 	EXEC_PROCEDURE QueryType = C.IIAPI_QT_EXEC_PROCEDURE
 )
 
-func runQuery(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
-	queryType QueryType) (*rows, error) {
+type stmt struct {
+	conn      *OpenAPIConn
+	query     string
+	queryType QueryType
+}
+
+func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error) {
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = connHandle
-	queryParm.qy_queryType = C.uint(queryType)
-	queryParm.qy_queryText = C.CString(queryStr)
+	queryParm.qy_queryType = C.uint(s.queryType)
+	queryParm.qy_queryText = C.CString(s.query)
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
 	queryParm.qy_stmtHandle = nil
 
-	// Run query
 	C.IIapi_query(&queryParm)
-	Wait(&queryParm.qy_genParm)
+	wait(&queryParm.qy_genParm)
 	err := checkError("IIapi_query()", &queryParm.qy_genParm)
 	if err != nil {
 		return nil, err
 	}
 
 	res := &rows{
+		stmt:             s,
 		transactionIsNew: transHandle == nil,
 		transHandle:      queryParm.qy_tranHandle,
 		stmtHandle:       queryParm.qy_stmtHandle,
-		queryType:        queryType,
 	}
 
 	// Get query result descriptors.
@@ -334,7 +338,7 @@ func runQuery(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
 	getDescrParm.gd_descriptor = nil
 
 	C.IIapi_getDescriptor(&getDescrParm)
-	Wait(&getDescrParm.gd_genParm)
+	wait(&getDescrParm.gd_genParm)
 
 	err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
 	if err != nil {
@@ -379,7 +383,7 @@ func rollbackTransaction(tranHandle C.II_PTR) error {
 	rollbackParm.rb_savePointHandle = nil
 
 	C.IIapi_rollback(&rollbackParm)
-	Wait(&rollbackParm.rb_genParm)
+	wait(&rollbackParm.rb_genParm)
 	return checkError("IIapi_rollback", &rollbackParm.rb_genParm)
 }
 
@@ -391,7 +395,7 @@ func commitTransaction(tranHandle C.II_PTR) error {
 	commitParm.cm_tranHandle = tranHandle
 
 	C.IIapi_commit(&commitParm)
-	Wait(&commitParm.cm_genParm)
+	wait(&commitParm.cm_genParm)
 	return checkError("IIapi_commit", &commitParm.cm_genParm)
 }
 
@@ -635,22 +639,22 @@ func (rs *rows) Close() error {
 	closeParm.cl_stmtHandle = rs.stmtHandle
 
 	C.IIapi_close(&closeParm)
-	Wait(&closeParm.cl_genParm)
+	wait(&closeParm.cl_genParm)
 	err := checkError("IIapi_close()", &closeParm.cl_genParm)
 
 	// close transaction if it was not specified by caller
 	if rs.transactionIsNew && rs.transHandle != nil {
-        if rs.queryType == SELECT || rs.queryType == SELECT_ONE {
-            rollbackErr := rollbackTransaction(rs.transHandle)
-            if rollbackErr != nil {
-                return rollbackErr
-            }
-        } else {
-            commitErr := commitTransaction(rs.transHandle)
-            if commitErr != nil {
-                return commitErr
-            }
-        }
+		if rs.queryType == SELECT || rs.queryType == SELECT_ONE {
+			rollbackErr := rollbackTransaction(rs.transHandle)
+			if rollbackErr != nil {
+				return rollbackErr
+			}
+		} else {
+			commitErr := commitTransaction(rs.transHandle)
+			if commitErr != nil {
+				return commitErr
+			}
+		}
 		rs.transHandle = nil
 	}
 
@@ -666,7 +670,7 @@ func (rs *rows) fetchData() error {
 	var err error
 
 	C.IIapi_getColumns(&rs.getColParm)
-	Wait(&rs.getColParm.gc_genParm)
+	wait(&rs.getColParm.gc_genParm)
 	err = checkError("IIapi_getColumns()", &rs.getColParm.gc_genParm)
 	if err != nil {
 		return err
@@ -693,7 +697,7 @@ func (rs *rows) fetchInfo() error {
 
 	info := &getQInfoParm
 	C.IIapi_getQueryInfo(info)
-	Wait(&info.gq_genParm)
+	wait(&info.gq_genParm)
 	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
 		if info.gq_rowStatus == C.IIAPI_ROW_INSERTED ||

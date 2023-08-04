@@ -28,25 +28,51 @@ func init() {
 	sql.Register("vector", d)
 }
 
-// Open opens a new connection to the database. name is a connection string.
-// Most users should only use it through database/sql package from the standard
-// library.
 func (d Driver) Open(name string) (driver.Conn, error) {
 	var params ConnParams
 	params.DbName = name
 	return env.Connect(params)
 }
 
-func (c *OpenAPIConn) QueryContext(ctx context.Context, query string,
-	args []driver.NamedValue) (*rows, error) {
-
-	return runQuery(c.handle, nil, query, SELECT)
+func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
+	return &stmt{
+		conn:      c,
+		query:     query,
+		queryType: queryType,
+	}
 }
 
-func (c *OpenAPIConn) ExecContext(ctx context.Context, query string,
-	args []driver.NamedValue) (*rows, error) {
+func (c *OpenAPIConn) Query(query string, args []driver.Value) (driver.Rows, error) {
 
-	rows, err := runQuery(c.handle, c.AutoCommitTransation.handle, query, EXEC)
+	s := makeStmt(c, query, SELECT)
+	return s.runQuery(c.handle, nil)
+}
+
+func (c *OpenAPIConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+
+	s := makeStmt(c, query, EXEC)
+	return s.Exec(args)
+}
+
+func (c *OpenAPIConn) Prepare(query string) (driver.Stmt, error) {
+	return makeStmt(c, query, SELECT), nil
+}
+
+func (c *OpenAPIConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return nil, nil
+}
+
+func (c *OpenAPIConn) Close() error {
+	return disconnect(c)
+}
+
+func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
+	s.queryType = EXEC
+	rows, err := s.runQuery(s.conn.handle, s.conn.AutoCommitTransation.handle)
 	if err != nil {
 		return nil, err
 	}
@@ -60,5 +86,15 @@ func (c *OpenAPIConn) ExecContext(ctx context.Context, query string,
 	return rows, nil
 }
 
-func (c *OpenAPIConn) Prepare(query string) (*stmt, error) {
+func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
+	s.queryType = SELECT
+	return s.runQuery(s.conn.handle, nil)
+}
+
+func (s *stmt) Close() error {
+	return nil
+}
+
+func (s *stmt) NumInput() int {
+    return -1
 }
