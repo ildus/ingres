@@ -41,6 +41,7 @@ import (
 	"time"
 	"unicode/utf16"
 	"unsafe"
+    "context"
 
 	"database/sql/driver"
 )
@@ -296,7 +297,7 @@ const (
 	EXEC_PROCEDURE QueryType = C.IIAPI_QT_EXEC_PROCEDURE
 )
 
-func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
+func runQuery(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
 	queryType QueryType) (*rows, error) {
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
@@ -392,25 +393,6 @@ func commitTransaction(tranHandle C.II_PTR) error {
 	C.IIapi_commit(&commitParm)
 	Wait(&commitParm.cm_genParm)
 	return checkError("IIapi_commit", &commitParm.cm_genParm)
-}
-
-func (c *OpenAPIConn) Fetch(queryStr string) (*rows, error) {
-	return query(c.handle, nil, queryStr, SELECT)
-}
-
-func (c *OpenAPIConn) Exec(queryStr string) (*rows, error) {
-	rows, err := query(c.handle, c.AutoCommitTransation.handle, queryStr, EXEC)
-	if err != nil {
-		return nil, err
-	}
-
-	rows.fetchInfo()
-	err = rows.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	return rows, nil
 }
 
 func checkError(location string, genParm *C.IIAPI_GENPARM) error {
