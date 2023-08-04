@@ -86,6 +86,7 @@ type rows struct {
 
 	transHandle C.II_PTR
 	stmtHandle  C.II_PTR
+	queryType   QueryType
 
 	finish func()
 	rowsHeader
@@ -321,6 +322,7 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
 		transactionIsNew: transHandle == nil,
 		transHandle:      queryParm.qy_tranHandle,
 		stmtHandle:       queryParm.qy_stmtHandle,
+		queryType:        queryType,
 	}
 
 	// Get query result descriptors.
@@ -367,7 +369,7 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
 	return res, nil
 }
 
-func closeTransaction(tranHandle C.II_PTR) error {
+func rollbackTransaction(tranHandle C.II_PTR) error {
 	var rollbackParm C.IIAPI_ROLLBACKPARM
 
 	rollbackParm.rb_genParm.gp_callback = nil
@@ -380,23 +382,35 @@ func closeTransaction(tranHandle C.II_PTR) error {
 	return checkError("IIapi_rollback", &rollbackParm.rb_genParm)
 }
 
+func commitTransaction(tranHandle C.II_PTR) error {
+	var commitParm C.IIAPI_COMMITPARM
+
+	commitParm.cm_genParm.gp_callback = nil
+	commitParm.cm_genParm.gp_closure = nil
+	commitParm.cm_tranHandle = tranHandle
+
+	C.IIapi_commit(&commitParm)
+	Wait(&commitParm.cm_genParm)
+	return checkError("IIapi_commit", &commitParm.cm_genParm)
+}
+
 func (c *OpenAPIConn) Fetch(queryStr string) (*rows, error) {
 	return query(c.handle, nil, queryStr, SELECT)
 }
 
 func (c *OpenAPIConn) Exec(queryStr string) (*rows, error) {
-    rows, err := query(c.handle, c.AutoCommitTransation.handle, queryStr, EXEC)
-    if err != nil {
-        return nil, err
-    }
+	rows, err := query(c.handle, c.AutoCommitTransation.handle, queryStr, EXEC)
+	if err != nil {
+		return nil, err
+	}
 
-    rows.fetchInfo()
-    err = rows.Close()
-    if err != nil {
-        return nil, err
-    }
+	rows.fetchInfo()
+	err = rows.Close()
+	if err != nil {
+		return nil, err
+	}
 
-    return rows, nil
+	return rows, nil
 }
 
 func checkError(location string, genParm *C.IIAPI_GENPARM) error {
@@ -644,16 +658,23 @@ func (rs *rows) Close() error {
 
 	// close transaction if it was not specified by caller
 	if rs.transactionIsNew && rs.transHandle != nil {
-		rollbackErr := closeTransaction(rs.transHandle)
-		if rollbackErr != nil {
-			return rollbackErr
-		}
-        rs.transHandle = nil
+        if rs.queryType == SELECT || rs.queryType == SELECT_ONE {
+            rollbackErr := rollbackTransaction(rs.transHandle)
+            if rollbackErr != nil {
+                return rollbackErr
+            }
+        } else {
+            commitErr := commitTransaction(rs.transHandle)
+            if commitErr != nil {
+                return commitErr
+            }
+        }
+		rs.transHandle = nil
 	}
 
 	if rs.cols != nil {
 		C.free(unsafe.Pointer(rs.cols))
-        rs.cols = nil
+		rs.cols = nil
 	}
 
 	return err
@@ -674,7 +695,7 @@ func (rs *rows) fetchData() error {
 	}
 
 	if rs.done {
-        rs.fetchInfo()
+		rs.fetchInfo()
 	}
 
 	return err
@@ -683,22 +704,22 @@ func (rs *rows) fetchData() error {
 func (rs *rows) fetchInfo() error {
 	var getQInfoParm C.IIAPI_GETQINFOPARM
 
-    /* Get fetch result info */
-    getQInfoParm.gq_genParm.gp_callback = nil
-    getQInfoParm.gq_genParm.gp_closure = nil
-    getQInfoParm.gq_stmtHandle = rs.stmtHandle
+	/* Get fetch result info */
+	getQInfoParm.gq_genParm.gp_callback = nil
+	getQInfoParm.gq_genParm.gp_closure = nil
+	getQInfoParm.gq_stmtHandle = rs.stmtHandle
 
-    info := &getQInfoParm
-    C.IIapi_getQueryInfo(info)
-    Wait(&info.gq_genParm)
-    err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
-    if err != nil {
-        if info.gq_rowStatus == C.IIAPI_ROW_INSERTED ||
-            info.gq_rowStatus == C.IIAPI_ROW_UPDATED ||
-            info.gq_rowStatus == C.IIAPI_ROW_DELETED {
-            rs.rowsAffected = int64(info.gq_rowCountEx)
-        }
-    }
+	info := &getQInfoParm
+	C.IIapi_getQueryInfo(info)
+	Wait(&info.gq_genParm)
+	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
+	if err != nil {
+		if info.gq_rowStatus == C.IIAPI_ROW_INSERTED ||
+			info.gq_rowStatus == C.IIAPI_ROW_UPDATED ||
+			info.gq_rowStatus == C.IIAPI_ROW_DELETED {
+			rs.rowsAffected = int64(info.gq_rowCountEx)
+		}
+	}
 
 	return err
 }
