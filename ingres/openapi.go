@@ -35,9 +35,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"reflect"
 	"sync"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"database/sql/driver"
@@ -80,6 +82,8 @@ type rowsHeader struct {
 }
 
 type rows struct {
+	transactionIsNew bool
+
 	transHandle C.II_PTR
 	stmtHandle  C.II_PTR
 
@@ -97,27 +101,30 @@ type rows struct {
 	getColParm C.IIAPI_GETCOLPARM
 }
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
+var (
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
 
-var nativeEndian binary.ByteOrder
-var _ driver.Result = rows{}
+	nativeEndian binary.ByteOrder
+	_            driver.Result = rows{}
+	verbose                    = false
+)
 
 func init() {
-    buf := [2]byte{}
-    *(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
+	buf := [2]byte{}
+	*(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
 
-    switch buf {
-    case [2]byte{0xCD, 0xAB}:
-        nativeEndian = binary.LittleEndian
-    case [2]byte{0xAB, 0xCD}:
-        nativeEndian = binary.BigEndian
-    default:
-        panic("Could not determine native endianness.")
-    }
+	switch buf {
+	case [2]byte{0xCD, 0xAB}:
+		nativeEndian = binary.LittleEndian
+	case [2]byte{0xAB, 0xCD}:
+		nativeEndian = binary.BigEndian
+	default:
+		panic("Could not determine native endianness.")
+	}
 }
 
 func InitOpenAPI() (*OpenAPIEnv, error) {
@@ -188,7 +195,7 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 		Wait(&abortParm.ab_genParm)
 
 		abortErr := checkError("IIapi_abort()", &abortParm.ab_genParm)
-		if abortErr != nil {
+		if verbose && abortErr != nil {
 			log.Printf("could not abort connection: %v", abortErr)
 		}
 	}
@@ -278,14 +285,25 @@ func Wait(genParm *C.IIAPI_GENPARM) {
 	}
 }
 
-func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, error) {
+type QueryType uint
+
+const (
+	SELECT         QueryType = C.IIAPI_QT_QUERY
+	SELECT_ONE     QueryType = C.IIAPI_QT_SELECT_SINGLETON
+	EXEC           QueryType = C.IIAPI_QT_EXEC
+	OPEN           QueryType = C.IIAPI_QT_OPEN
+	EXEC_PROCEDURE QueryType = C.IIAPI_QT_EXEC_PROCEDURE
+)
+
+func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string,
+	queryType QueryType) (*rows, error) {
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = connHandle
-	queryParm.qy_queryType = C.IIAPI_QT_OPEN
+	queryParm.qy_queryType = C.uint(queryType)
 	queryParm.qy_queryText = C.CString(queryStr)
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
@@ -300,8 +318,9 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, e
 	}
 
 	res := &rows{
-		transHandle: queryParm.qy_tranHandle,
-		stmtHandle:  queryParm.qy_stmtHandle,
+		transactionIsNew: transHandle == nil,
+		transHandle:      queryParm.qy_tranHandle,
+		stmtHandle:       queryParm.qy_stmtHandle,
 	}
 
 	// Get query result descriptors.
@@ -316,6 +335,7 @@ func query(connHandle C.II_PTR, transHandle C.II_PTR, queryStr string) (*rows, e
 
 	err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
 	if err != nil {
+		res.Close()
 		return nil, err
 	}
 
@@ -361,7 +381,22 @@ func closeTransaction(tranHandle C.II_PTR) error {
 }
 
 func (c *OpenAPIConn) Fetch(queryStr string) (*rows, error) {
-	return query(c.handle, nil, queryStr)
+	return query(c.handle, nil, queryStr, SELECT)
+}
+
+func (c *OpenAPIConn) Exec(queryStr string) (*rows, error) {
+    rows, err := query(c.handle, c.AutoCommitTransation.handle, queryStr, EXEC)
+    if err != nil {
+        return nil, err
+    }
+
+    rows.fetchInfo()
+    err = rows.Close()
+    if err != nil {
+        return nil, err
+    }
+
+    return rows, nil
 }
 
 func checkError(location string, genParm *C.IIAPI_GENPARM) error {
@@ -433,7 +468,7 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 		}
 	}
 
-	if err != nil {
+	if verbose && err != nil {
 		log.Printf("%v\n", err)
 	}
 
@@ -607,22 +642,24 @@ func (rs *rows) Close() error {
 	Wait(&closeParm.cl_genParm)
 	err := checkError("IIapi_close()", &closeParm.cl_genParm)
 
-	if rs.transHandle != nil {
+	// close transaction if it was not specified by caller
+	if rs.transactionIsNew && rs.transHandle != nil {
 		rollbackErr := closeTransaction(rs.transHandle)
 		if rollbackErr != nil {
 			return rollbackErr
 		}
+        rs.transHandle = nil
 	}
 
 	if rs.cols != nil {
 		C.free(unsafe.Pointer(rs.cols))
+        rs.cols = nil
 	}
 
 	return err
 }
 
 func (rs *rows) fetchData() error {
-	var getQInfoParm C.IIAPI_GETQINFOPARM
 	var err error
 
 	C.IIapi_getColumns(&rs.getColParm)
@@ -637,15 +674,31 @@ func (rs *rows) fetchData() error {
 	}
 
 	if rs.done {
-		/* Get fetch result info */
-		getQInfoParm.gq_genParm.gp_callback = nil
-		getQInfoParm.gq_genParm.gp_closure = nil
-		getQInfoParm.gq_stmtHandle = rs.stmtHandle
-
-		C.IIapi_getQueryInfo(&getQInfoParm)
-		Wait(&getQInfoParm.gq_genParm)
-		err = checkError("IIapi_getQueryInfo()", &getQInfoParm.gq_genParm)
+        rs.fetchInfo()
 	}
+
+	return err
+}
+
+func (rs *rows) fetchInfo() error {
+	var getQInfoParm C.IIAPI_GETQINFOPARM
+
+    /* Get fetch result info */
+    getQInfoParm.gq_genParm.gp_callback = nil
+    getQInfoParm.gq_genParm.gp_closure = nil
+    getQInfoParm.gq_stmtHandle = rs.stmtHandle
+
+    info := &getQInfoParm
+    C.IIapi_getQueryInfo(info)
+    Wait(&info.gq_genParm)
+    err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
+    if err != nil {
+        if info.gq_rowStatus == C.IIAPI_ROW_INSERTED ||
+            info.gq_rowStatus == C.IIAPI_ROW_UPDATED ||
+            info.gq_rowStatus == C.IIAPI_ROW_DELETED {
+            rs.rowsAffected = int64(info.gq_rowCountEx)
+        }
+    }
 
 	return err
 }
@@ -664,13 +717,42 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		case 8:
 			res = int64(nativeEndian.Uint64(val))
 		}
-	case C.IIAPI_CHR_TYPE:
-		fallthrough
-	case C.IIAPI_CHA_TYPE:
-		fallthrough
-	case C.IIAPI_VCH_TYPE:
+	case C.IIAPI_FLT_TYPE:
+		switch col.length {
+		case 4:
+			bits := nativeEndian.Uint32(val)
+			res = math.Float32frombits(bits)
+		case 8:
+			bits := nativeEndian.Uint64(val)
+			res = math.Float64frombits(bits)
+		}
+	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
 		res = string(val)
+	case C.IIAPI_LVCH_TYPE:
+		fallthrough
+	case C.IIAPI_LTXT_TYPE:
+		fallthrough
+	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
+		res = string(val[2:])
+	case C.IIAPI_BOOL_TYPE:
+		res = (val[0] == 1)
+	case C.IIAPI_VBYTE_TYPE:
+		res = val[2:]
+	case C.IIAPI_BYTE_TYPE:
+		res = val
+	case C.IIAPI_NVCH_TYPE:
+		val = val[2:]
+		fallthrough
+	case C.IIAPI_NCHA_TYPE:
+		out := make([]uint16, len(val)/2)
+		for i := range out {
+			out[i] = nativeEndian.Uint16(val[i*2:])
+		}
+		res = string(utf16.Decode(out))
+	default:
+		return nil, errors.New("type is not supported")
 	}
+
 	return res, nil
 }
 
