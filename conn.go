@@ -28,7 +28,7 @@ func init() {
 	sql.Register("vector", d)
 }
 
-func (d Driver) Open(name string) (*OpenAPIConn, error) {
+func (d Driver) Open(name string) (driver.Conn, error) {
 	var params ConnParams
 	params.DbName = name
 	return env.Connect(params)

@@ -2,29 +2,7 @@ package ingres
 
 import (
 	"reflect"
-    "errors"
-
-	"database/sql/driver"
 )
-
-type noRows struct{}
-
-var (
-    emptyRows noRows
-
-	errNoRowsAffected  = errors.New("no RowsAffected available after the empty statement")
-	errNoLastInsertID  = errors.New("no LastInsertId available after the empty statement")
-)
-
-var _ driver.Result = noRows{}
-
-func (noRows) LastInsertId() (int64, error) {
-	return 0, errNoLastInsertID
-}
-
-func (noRows) RowsAffected() (int64, error) {
-	return 0, errNoRowsAffected
-}
 
 // ColumnTypeScanType returns the value type that can be used to scan types into.
 func (rs *rows) ColumnTypeScanType(index int) reflect.Type {
@@ -59,14 +37,6 @@ func (rs *rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok 
 
 func (rs *rows) Columns() []string {
 	return rs.colNames
-}
-
-func (rs *rows) Result() driver.Result {
-	if rs.result == nil {
-		return emptyRows
-	}
-
-	return rs.result
 }
 
 func (rs rows) LastInsertId() (int64, error) {

@@ -19,18 +19,18 @@ func TestInitOpenAPI(t *testing.T) {
 
 func TestConnect(t *testing.T) {
 	env, err := InitOpenAPI()
-	require.Equal(t, err, nil)
+	require.Equal(t, nil, err)
 	defer ReleaseOpenAPI(env)
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, err, nil)
+	require.Equal(t, nil, err)
 	defer conn.Close()
 
 	err = conn.AutoCommit()
-	require.Equal(t, err, nil)
+	require.Equal(t, nil, err)
 
 	err = conn.DisableAutoCommit()
-	require.Equal(t, err, nil)
+	require.Equal(t, nil, err)
 }
 
 func TestManyRows(t *testing.T) {
@@ -76,10 +76,10 @@ func TestHandleError(t *testing.T) {
 
 func testconn(t *testing.T) (*OpenAPIConn, func()) {
 	env, err := InitOpenAPI()
-	require.Equal(t, err, nil)
+	require.Equal(t, nil, err)
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	assert.Equal(t, err, nil)
+	require.Equal(t, nil, err)
     if err != nil {
         ReleaseOpenAPI(env)
         t.Fail()
