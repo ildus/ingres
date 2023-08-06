@@ -41,6 +41,7 @@ import (
 	"time"
 	"unicode/utf16"
 	"unsafe"
+    "strings"
 
 	"database/sql/driver"
 )
@@ -736,13 +737,13 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			res = math.Float64frombits(bits)
 		}
 	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
-		res = string(val)
+		res = strings.TrimRight(string(val), "\x00")
 	case C.IIAPI_LVCH_TYPE:
 		fallthrough
 	case C.IIAPI_LTXT_TYPE:
 		fallthrough
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
-		res = string(val[2:])
+		res = strings.TrimRight(string(val[2:]), "\x00")
 	case C.IIAPI_BOOL_TYPE:
 		res = (val[0] == 1)
 	case C.IIAPI_VBYTE_TYPE:
@@ -758,6 +759,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			out[i] = nativeEndian.Uint16(val[i*2:])
 		}
 		res = string(utf16.Decode(out))
+		res = strings.TrimRight(res.(string), "\x00")
 	default:
 		return nil, errors.New("type is not supported")
 	}
