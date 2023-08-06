@@ -82,8 +82,8 @@ type rowsHeader struct {
 }
 
 type rows struct {
-	stmt             *stmt
-	transactionIsNew bool
+	stmt                 *stmt
+	isOneTimeTransaction bool
 
 	transHandle C.II_PTR
 	stmtHandle  C.II_PTR
@@ -324,10 +324,10 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 	}
 
 	res := &rows{
-		stmt:             s,
-		transactionIsNew: transHandle == nil,
-		transHandle:      queryParm.qy_tranHandle,
-		stmtHandle:       queryParm.qy_stmtHandle,
+		stmt:                 s,
+		isOneTimeTransaction: transHandle == nil,
+		transHandle:          queryParm.qy_tranHandle,
+		stmtHandle:           queryParm.qy_stmtHandle,
 	}
 
 	// Get query result descriptors.
@@ -400,26 +400,26 @@ func commitTransaction(tranHandle C.II_PTR) error {
 }
 
 func checkError(location string, genParm *C.IIAPI_GENPARM) error {
-	var desc string
+	var status, desc string
 	var err error
 
 	if genParm.gp_status >= C.IIAPI_ST_ERROR {
 		switch genParm.gp_status {
 		case C.IIAPI_ST_ERROR:
-			desc = "IIAPI_ST_ERROR"
+			status = "IIAPI_ST_ERROR"
 		case C.IIAPI_ST_FAILURE:
-			desc = "IIAPI_ST_FAILURE"
+			status = "IIAPI_ST_FAILURE"
 		case C.IIAPI_ST_NOT_INITIALIZED:
-			desc = "IIAPI_ST_NOT_INITIALIZED"
+			status = "IIAPI_ST_NOT_INITIALIZED"
 		case C.IIAPI_ST_INVALID_HANDLE:
-			desc = "IIAPI_ST_INVALID_HANDLE"
+			status = "IIAPI_ST_INVALID_HANDLE"
 		case C.IIAPI_ST_OUT_OF_MEMORY:
-			desc = "IIAPI_ST_OUT_OF_MEMORY"
+			status = "IIAPI_ST_OUT_OF_MEMORY"
 		default:
-			desc = fmt.Sprintf("%d", genParm.gp_status)
+			status = fmt.Sprintf("%d", genParm.gp_status)
 		}
 
-		err = fmt.Errorf("%s status = %s", location, desc)
+		err = fmt.Errorf("%s status = %s", location, status)
 	}
 
 	if genParm.gp_errorHandle != nil {
@@ -457,22 +457,24 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 				msg = C.GoString(getErrParm.ge_message)
 			}
 
-			errText := fmt.Sprintf("Type:%s State:%s Code:0x%x Message:%s",
-				desc, getErrParm.ge_SQLSTATE, getErrParm.ge_errorCode, msg)
+            msg = fmt.Sprintf("%s: %s", desc, msg)
 
+            state := fmt.Sprintf("%s", getErrParm.ge_SQLSTATE)
+            errorCode := int(getErrParm.ge_errorCode)
 			if err != nil {
-				err = fmt.Errorf("%w\n%s", err, errText)
+				wrapped := fmt.Errorf("%w\n%s", err, msg)
+				err = newIngresError(state, errorCode, wrapped)
 			} else {
-				err = fmt.Errorf(errText)
+				err = newIngresError(state, errorCode, fmt.Errorf(msg))
 			}
 		}
 	}
 
-	if verbose && err != nil {
-		log.Printf("%v\n", err)
-	}
+    if err != nil && verbose {
+        log.Printf("%v\n", err)
+    }
 
-	return err
+    return err
 }
 
 func (c *columnDesc) getType() reflect.Type {
@@ -643,8 +645,8 @@ func (rs *rows) Close() error {
 	err := checkError("IIapi_close()", &closeParm.cl_genParm)
 
 	// close transaction if it was not specified by caller
-	if rs.transactionIsNew && rs.transHandle != nil {
-		if rs.queryType == SELECT || rs.queryType == SELECT_ONE {
+	if rs.isOneTimeTransaction && rs.transHandle != nil {
+		if err != nil || rs.queryType == SELECT || rs.queryType == SELECT_ONE {
 			rollbackErr := rollbackTransaction(rs.transHandle)
 			if rollbackErr != nil {
 				return rollbackErr

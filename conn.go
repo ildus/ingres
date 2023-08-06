@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"log"
 )
 
@@ -16,6 +17,28 @@ var (
 // Driver is the Ingres database driver.
 type Driver struct{}
 
+type IngresError struct {
+	State     string
+	ErrorCode int
+	Err       error
+}
+
+func newIngresError(state string, code int, err error) *IngresError {
+	return &IngresError{
+		State:     state,
+		ErrorCode: code,
+		Err:       err,
+	}
+}
+
+func (e *IngresError) Error() string {
+	return fmt.Sprintf("%v", e.Err)
+}
+
+func (e *IngresError) Unwrap() error {
+	return e.Err
+}
+
 func init() {
 	var err error
 	env, err = InitOpenAPI()
@@ -25,13 +48,22 @@ func init() {
 
 	d := &Driver{}
 	sql.Register("ingres", d)
-	sql.Register("vector", d)
 }
 
 func (d Driver) Open(name string) (driver.Conn, error) {
 	var params ConnParams
 	params.DbName = name
-	return env.Connect(params)
+    conn, err := env.Connect(params)
+    if err != nil {
+        return nil, err
+    }
+    err = conn.AutoCommit()
+    if err != nil {
+        conn.Close()
+        return nil, err
+    }
+
+    return conn, nil
 }
 
 func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
@@ -96,5 +128,5 @@ func (s *stmt) Close() error {
 }
 
 func (s *stmt) NumInput() int {
-    return -1
+	return -1
 }
