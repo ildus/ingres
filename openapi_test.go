@@ -4,7 +4,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/assert"
 	"io"
-	"log"
 	"testing"
 
 	"database/sql/driver"
@@ -19,28 +18,27 @@ func TestInitOpenAPI(t *testing.T) {
 
 func TestConnect(t *testing.T) {
 	env, err := InitOpenAPI()
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
 	defer ReleaseOpenAPI(env)
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
 	defer conn.Close()
 
 	err = conn.AutoCommit()
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
 
 	err = conn.DisableAutoCommit()
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
 }
 
 func TestManyRows(t *testing.T) {
-	env, err := InitOpenAPI()
-	require.Equal(t, err, nil)
-	defer ReleaseOpenAPI(env)
+    conn, deinit := testconn(t)
+    defer deinit()
 
-	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, err, nil)
-	defer conn.Close()
+    tx, err := conn.Begin()
+	require.NoError(t, err)
+    defer tx.Rollback()
 
 	rows, err := conn.Query("select reltid, relid from iirelation limit 5", nil)
 	require.Equal(t, err, nil)
@@ -48,24 +46,25 @@ func TestManyRows(t *testing.T) {
 	assert.Equal(t, rows.Columns()[1], "relid")
 	defer rows.Close()
 
+    count := 0
 	for {
 		var dest = make([]driver.Value, len(rows.Columns()))
 		if rows.Next(dest) == io.EOF {
 			break
 		}
 
-		log.Println(dest)
+        count += 1
 	}
+    assert.Equal(t, 5, count)
 }
 
 func TestHandleError(t *testing.T) {
-	env, err := InitOpenAPI()
-	require.Equal(t, err, nil)
-	defer ReleaseOpenAPI(env)
+    conn, deinit := testconn(t)
+    defer deinit()
 
-	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, err, nil)
-	defer conn.Close()
+    tx, err := conn.Begin()
+	require.NoError(t, err)
+    defer tx.Rollback()
 
     // should be error
 	rows, err := conn.Query("select reltid, from iirelation", nil)
@@ -76,10 +75,10 @@ func TestHandleError(t *testing.T) {
 
 func testconn(t *testing.T) (*OpenAPIConn, func()) {
 	env, err := InitOpenAPI()
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
 
 	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, nil, err)
+	require.NoError(t, err)
     if err != nil {
         ReleaseOpenAPI(env)
         t.Fail()
@@ -95,30 +94,59 @@ func TestExec(t *testing.T) {
     conn, deinit := testconn(t)
     defer deinit()
 
-    conn.AutoCommit()
+    err := conn.AutoCommit()
+	require.NoError(t, err)
     defer conn.DisableAutoCommit()
 
-	result, err := conn.Exec("create table if not exists test_table(a int)", nil)
+	_, err = conn.Exec("create table if not exists test_table(a int)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_table values (1), (2)", nil)
+	require.NoError(t, err)
+
+    rows, err := conn.Query("select count(*) from test_table", nil)
+	require.NoError(t, err)
+    defer rows.Close()
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	rows.Next(dest)
+    assert.Equal(t, int32(2), dest[0].(int32))
+
+	_, err = conn.Exec("drop table test_table", nil)
+	require.NoError(t, err)
+}
+
+func TestFetch(t *testing.T) {
+    conn, deinit := testconn(t)
+    defer deinit()
+
+    tx, err := conn.Begin()
 	require.Nil(t, err)
 
-	result, err = conn.Exec("insert into test_table values (1), (2)", nil)
+	_, err = conn.Exec("create table if not exists test_table(a int)", nil)
 	require.Nil(t, err)
 
-    count, _ := result.RowsAffected()
-    assert.Equal(t, 2, count)
-
-	result, err = conn.Exec("drop table test_table", nil)
+	_, err = conn.Exec("insert into test_table values (1), (2)", nil)
 	require.Nil(t, err)
+
+	_, err = conn.Exec("select * from test_table", nil)
+	require.Nil(t, err)
+
+	_, err = conn.Exec("drop table test_table", nil)
+	require.Nil(t, err)
+
+    err = tx.Commit()
+	require.Nil(t, err)
+
 }
 
 func TestDecode(t *testing.T) {
-	env, err := InitOpenAPI()
-	require.Equal(t, err, nil)
-	defer ReleaseOpenAPI(env)
+    conn, deinit := testconn(t)
+    defer deinit()
 
-	conn, err := env.Connect(ConnParams{DbName: "mydb"})
-	require.Equal(t, err, nil)
-	defer conn.Close()
+    tx, err := conn.Begin()
+	require.NoError(t, err)
+    defer tx.Rollback()
 
 	rows, err := conn.Query(`select
             int1(10), int2(11),int4(12), int8(13),

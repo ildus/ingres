@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"log"
 )
@@ -53,17 +54,17 @@ func init() {
 func (d Driver) Open(name string) (driver.Conn, error) {
 	var params ConnParams
 	params.DbName = name
-    conn, err := env.Connect(params)
-    if err != nil {
-        return nil, err
-    }
-    err = conn.AutoCommit()
-    if err != nil {
-        conn.Close()
-        return nil, err
-    }
+	conn, err := env.Connect(params)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.AutoCommit()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 
-    return conn, nil
+	return conn, nil
 }
 
 func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
@@ -75,13 +76,11 @@ func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
 }
 
 func (c *OpenAPIConn) Query(query string, args []driver.Value) (driver.Rows, error) {
-
 	s := makeStmt(c, query, SELECT)
 	return s.Query(args)
 }
 
 func (c *OpenAPIConn) Exec(query string, args []driver.Value) (driver.Result, error) {
-
 	s := makeStmt(c, query, EXEC)
 	return s.Exec(args)
 }
@@ -94,17 +93,16 @@ func (c *OpenAPIConn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	return nil, nil
-}
-
 func (c *OpenAPIConn) Close() error {
 	return disconnect(c)
 }
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.queryType = EXEC
-	rows, err := s.runQuery(s.conn.handle, s.conn.AutoCommitTransation.handle)
+	if s.conn.currentTransaction == nil {
+		return nil, errors.New("transaction required")
+	}
+	rows, err := s.runQuery(s.conn.handle, s.conn.currentTransaction.handle)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +118,12 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.queryType = SELECT
-	return s.runQuery(s.conn.handle, s.conn.AutoCommitTransation.handle)
+
+	if s.conn.currentTransaction == nil {
+		return nil, errors.New("transaction required")
+	}
+
+	return s.runQuery(s.conn.handle, s.conn.currentTransaction.handle)
 }
 
 func (s *stmt) Close() error {
@@ -129,4 +132,12 @@ func (s *stmt) Close() error {
 
 func (s *stmt) NumInput() int {
 	return -1
+}
+
+func (t *OpenAPITransaction) Commit() error {
+	return commitTransaction(t.handle)
+}
+
+func (t *OpenAPITransaction) Rollback() error {
+	return rollbackTransaction(t.handle)
 }

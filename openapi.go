@@ -30,6 +30,7 @@ static inline void set_dv_value(IIAPI_DATAVALUE *dest, int i, void *val)
 import "C"
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -37,11 +38,11 @@ import (
 	"log"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf16"
 	"unsafe"
-    "strings"
 
 	"database/sql/driver"
 )
@@ -51,14 +52,15 @@ type OpenAPIEnv struct {
 }
 
 type OpenAPIConn struct {
-	env                  *OpenAPIEnv
-	handle               C.II_PTR
-	AutoCommitTransation OpenAPITransaction
+	env                *OpenAPIEnv
+	handle             C.II_PTR
+	currentTransaction *OpenAPITransaction
 }
 
 type OpenAPITransaction struct {
-	conn   *OpenAPIConn
-	handle C.II_PTR
+	conn       *OpenAPIConn
+	handle     C.II_PTR
+	autocommit bool
 }
 
 type ConnParams struct {
@@ -83,8 +85,8 @@ type rowsHeader struct {
 }
 
 type rows struct {
-	stmt                 *stmt
-	isOneTimeTransaction bool
+	stmt               *stmt
+	transactionCreated bool
 
 	transHandle C.II_PTR
 	stmtHandle  C.II_PTR
@@ -248,6 +250,10 @@ func autoCommit(connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
 }
 
 func (c *OpenAPIConn) AutoCommit() error {
+	if c.currentTransaction != nil {
+		return errors.New("can't enable autocommit with active transactions")
+	}
+
 	handle, err := autoCommit(c.handle, nil)
 	if err != nil {
 		if handle != nil {
@@ -257,19 +263,42 @@ func (c *OpenAPIConn) AutoCommit() error {
 		return err
 	}
 
-	c.AutoCommitTransation = OpenAPITransaction{conn: c, handle: handle}
+	c.currentTransaction = &OpenAPITransaction{conn: c, handle: handle, autocommit: true}
 	return nil
+}
+
+func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.currentTransaction != nil {
+		return nil, fmt.Errorf("%s", "already in transaction")
+	}
+
+	s := makeStmt(c, "begin transaction", EXEC)
+	rows, err := s.runQuery(s.conn.handle, nil)
+	if err != nil {
+		return nil, err
+	}
+
+    err = rows.Close()
+    if err != nil {
+        return nil, err
+    }
+
+	c.currentTransaction = s.transaction
+	return s.transaction, nil
 }
 
 func (c *OpenAPIConn) DisableAutoCommit() error {
 	var err error
 
-	if c.AutoCommitTransation.handle != nil {
+	if c.currentTransaction != nil {
+		if !c.currentTransaction.autocommit {
+			return errors.New("can't disable autocommit: there is ongoing transaction")
+		}
 		var nullHandle C.II_PTR = nil
-		_, err = autoCommit(nullHandle, c.AutoCommitTransation.handle)
+		_, err = autoCommit(nullHandle, c.currentTransaction.handle)
 	}
 
-	c.AutoCommitTransation.handle = nil
+	c.currentTransaction = nil
 	return err
 }
 
@@ -299,9 +328,10 @@ const (
 )
 
 type stmt struct {
-	conn      *OpenAPIConn
-	query     string
-	queryType QueryType
+	conn        *OpenAPIConn
+	query       string
+	queryType   QueryType
+	transaction *OpenAPITransaction
 }
 
 func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error) {
@@ -325,52 +355,59 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 	}
 
 	res := &rows{
-		stmt:                 s,
-		isOneTimeTransaction: transHandle == nil,
-		transHandle:          queryParm.qy_tranHandle,
-		stmtHandle:           queryParm.qy_stmtHandle,
+		stmt:               s,
+		transactionCreated: transHandle == nil,
+		transHandle:        queryParm.qy_tranHandle,
+		stmtHandle:         queryParm.qy_stmtHandle,
+	}
+
+	s.transaction = &OpenAPITransaction{
+		handle: queryParm.qy_tranHandle,
+		conn:   s.conn,
 	}
 
 	// Get query result descriptors.
-	getDescrParm.gd_genParm.gp_callback = nil
-	getDescrParm.gd_genParm.gp_closure = nil
-	getDescrParm.gd_stmtHandle = res.stmtHandle
-	getDescrParm.gd_descriptorCount = 0
-	getDescrParm.gd_descriptor = nil
+    if s.queryType != EXEC {
+        getDescrParm.gd_genParm.gp_callback = nil
+        getDescrParm.gd_genParm.gp_closure = nil
+        getDescrParm.gd_stmtHandle = res.stmtHandle
+        getDescrParm.gd_descriptorCount = 0
+        getDescrParm.gd_descriptor = nil
 
-	C.IIapi_getDescriptor(&getDescrParm)
-	wait(&getDescrParm.gd_genParm)
+        C.IIapi_getDescriptor(&getDescrParm)
+        wait(&getDescrParm.gd_genParm)
 
-	err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
-	if err != nil {
-		res.Close()
-		return nil, err
-	}
+        err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
+        if err != nil {
+            res.Close()
+            return nil, err
+        }
 
-	res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
-	res.colNames = make([]string, getDescrParm.gd_descriptorCount)
-	res.cols = C.allocate_cols(getDescrParm.gd_descriptorCount)
-	res.vals = make([][]byte, len(res.colTyps))
+        res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
+        res.colNames = make([]string, getDescrParm.gd_descriptorCount)
+        res.cols = C.allocate_cols(getDescrParm.gd_descriptorCount)
+        res.vals = make([][]byte, len(res.colTyps))
 
-	for i := 0; i < len(res.colTyps); i++ {
-		descr := C.get_descr(&getDescrParm, C.ulong(i))
-		res.colTyps[i].ingDataType = descr.ds_dataType
-		res.colTyps[i].nullable = (descr.ds_nullable == 1)
-		res.colTyps[i].length = uint16(descr.ds_length)
-		res.colTyps[i].precision = int16(descr.ds_precision)
-		res.colTyps[i].scale = int16(descr.ds_scale)
+        for i := 0; i < len(res.colTyps); i++ {
+            descr := C.get_descr(&getDescrParm, C.ulong(i))
+            res.colTyps[i].ingDataType = descr.ds_dataType
+            res.colTyps[i].nullable = (descr.ds_nullable == 1)
+            res.colTyps[i].length = uint16(descr.ds_length)
+            res.colTyps[i].precision = int16(descr.ds_precision)
+            res.colTyps[i].scale = int16(descr.ds_scale)
 
-		res.colNames[i] = C.GoString(descr.ds_columnName)
-		res.vals[i] = make([]byte, res.colTyps[i].length)
-		C.set_dv_value(res.cols, C.int(i), unsafe.Pointer(&res.vals[i][0]))
-	}
-	res.getColParm.gc_genParm.gp_callback = nil
-	res.getColParm.gc_genParm.gp_closure = nil
-	res.getColParm.gc_rowCount = 1
-	res.getColParm.gc_columnCount = getDescrParm.gd_descriptorCount
-	res.getColParm.gc_columnData = res.cols
-	res.getColParm.gc_stmtHandle = res.stmtHandle
-	res.getColParm.gc_moreSegments = 0
+            res.colNames[i] = C.GoString(descr.ds_columnName)
+            res.vals[i] = make([]byte, res.colTyps[i].length)
+            C.set_dv_value(res.cols, C.int(i), unsafe.Pointer(&res.vals[i][0]))
+        }
+        res.getColParm.gc_genParm.gp_callback = nil
+        res.getColParm.gc_genParm.gp_closure = nil
+        res.getColParm.gc_rowCount = 1
+        res.getColParm.gc_columnCount = getDescrParm.gd_descriptorCount
+        res.getColParm.gc_columnData = res.cols
+        res.getColParm.gc_stmtHandle = res.stmtHandle
+        res.getColParm.gc_moreSegments = 0
+    }
 
 	return res, nil
 }
@@ -458,10 +495,10 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 				msg = C.GoString(getErrParm.ge_message)
 			}
 
-            msg = fmt.Sprintf("%s: %s", desc, msg)
+			msg = fmt.Sprintf("%s: %s", desc, msg)
 
-            state := fmt.Sprintf("%s", getErrParm.ge_SQLSTATE)
-            errorCode := int(getErrParm.ge_errorCode)
+			state := fmt.Sprintf("%s", getErrParm.ge_SQLSTATE)
+			errorCode := int(getErrParm.ge_errorCode)
 			if err != nil {
 				wrapped := fmt.Errorf("%w\n%s", err, msg)
 				err = newIngresError(state, errorCode, wrapped)
@@ -471,11 +508,11 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 		}
 	}
 
-    if err != nil && verbose {
-        log.Printf("%v\n", err)
-    }
+	if err != nil && verbose {
+		log.Printf("%v\n", err)
+	}
 
-    return err
+	return err
 }
 
 func (c *columnDesc) getType() reflect.Type {
@@ -630,11 +667,7 @@ func (c *columnDesc) Length() (int64, bool) {
 	return val, true
 }
 
-func (rs *rows) Close() error {
-	if finish := rs.finish; finish != nil {
-		defer finish()
-	}
-
+func (rs *rows) closeStmt() error {
 	var closeParm C.IIAPI_CLOSEPARM
 
 	closeParm.cl_genParm.gp_callback = nil
@@ -645,21 +678,15 @@ func (rs *rows) Close() error {
 	wait(&closeParm.cl_genParm)
 	err := checkError("IIapi_close()", &closeParm.cl_genParm)
 
-	// close transaction if it was not specified by caller
-	if rs.isOneTimeTransaction && rs.transHandle != nil {
-		if err != nil || rs.queryType == SELECT || rs.queryType == SELECT_ONE {
-			rollbackErr := rollbackTransaction(rs.transHandle)
-			if rollbackErr != nil {
-				return rollbackErr
-			}
-		} else {
-			commitErr := commitTransaction(rs.transHandle)
-			if commitErr != nil {
-				return commitErr
-			}
-		}
-		rs.transHandle = nil
+	return err
+}
+
+func (rs *rows) Close() error {
+	if finish := rs.finish; finish != nil {
+		defer finish()
 	}
+
+	err := rs.closeStmt()
 
 	if rs.cols != nil {
 		C.free(unsafe.Pointer(rs.cols))
@@ -703,11 +730,7 @@ func (rs *rows) fetchInfo() error {
 	wait(&info.gq_genParm)
 	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
-		if info.gq_rowStatus == C.IIAPI_ROW_INSERTED ||
-			info.gq_rowStatus == C.IIAPI_ROW_UPDATED ||
-			info.gq_rowStatus == C.IIAPI_ROW_DELETED {
-			rs.rowsAffected = int64(info.gq_rowCountEx)
-		}
+		rs.rowsAffected = int64(info.gq_rowCountEx)
 	}
 
 	return err
