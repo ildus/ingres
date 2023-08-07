@@ -209,7 +209,7 @@ func TestLongVarchar(t *testing.T) {
 
 	dest := make([]driver.Value, len(rows.Columns()))
 
-    // 1st line
+	// 1st line
 	err = rows.Next(dest)
 	require.NoError(t, err)
 
@@ -222,7 +222,7 @@ func TestLongVarchar(t *testing.T) {
 	}
 	require.Equal(t, dest[2].(int32), int32(2))
 
-    // 2nd line
+	// 2nd line
 	err = rows.Next(dest)
 	require.NoError(t, err)
 	require.Equal(t, dest[0].(int32), int32(3))
@@ -234,7 +234,7 @@ func TestLongVarchar(t *testing.T) {
 	}
 	require.Equal(t, dest[2].(int32), int32(4))
 
-    // 3rd line
+	// 3rd line
 	err = rows.Next(dest)
 	require.NoError(t, err)
 	require.Equal(t, dest[0].(int32), int32(3))
@@ -343,4 +343,63 @@ func TestLongBytes(t *testing.T) {
 		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
 	}
 	require.Equal(t, dest[2].(int32), int32(4))
+}
+
+func TestDates(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, err = conn.Exec("drop table if exists test_dates", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`create table test_dates(
+        d1 ingresdate,
+        d2 date,
+        t1 time with time zone,
+        t2 time without time zone,
+        t3 time with local time zone,
+        ts1 timestamp with time zone,
+        ts2 timestamp without time zone,
+        ts3 timestamp with local time zone,
+        i1 interval year to month,
+        i2 interval day to second
+    )`, nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`insert into test_dates values (
+        '2021-10-10',
+        '2022-10-10',
+        '12:30:55-05:00',
+        '12:30:55',
+        '12:30:56',
+        '2006-12-15 9:30:55-08:00',
+        '2007-12-15 12:30:55',
+        '2008-12-15 12:30:55',
+        '55-4',
+        '-18 12:02:23.12345'
+    )`, nil)
+	require.NoError(t, err)
+
+	rows, err := conn.Query(`select * from test_dates`, nil)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(dest)
+	require.NoError(t, err)
+
+	assert.Equal(t, dest[0].(string), "10-oct-2021")
+	assert.Equal(t, dest[1].(string), "2022-10-10")
+	assert.Equal(t, dest[2].(string), "12:30:55-05:00")
+	assert.Equal(t, dest[3].(string), "12:30:55")
+	assert.Equal(t, dest[4].(string), "12:30:56")
+	assert.Equal(t, dest[5].(string), "2006-12-15 09:30:55-08:00")
+	assert.Equal(t, dest[6].(string), "2007-12-15 12:30:55")
+	assert.Equal(t, dest[7].(string), "2008-12-15 12:30:55")
+	assert.Equal(t, dest[8].(string), "55-04")
+	assert.Equal(t, dest[9].(string), "-18 12:02:23")
 }

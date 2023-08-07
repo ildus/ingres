@@ -4,6 +4,7 @@ package ingres
 #cgo pkg-config: iiapi
 
 #include <stdlib.h>
+#include <string.h>
 #include <iiapi.h>
 
 IIAPI_INITPARM InitParm = {0, IIAPI_VERSION, 0, NULL};
@@ -29,7 +30,42 @@ static inline void set_dv_length(IIAPI_DATAVALUE *dest, int i, short len)
     dest[i].dv_length = len;
 }
 
-//common/aif/demo/apiautil.c
+static IIAPI_STATUS convertToStr(IIAPI_DT_ID dt, II_PTR val, ushort len,
+    II_PTR buf, ushort buflen)
+{
+    IIAPI_CONVERTPARM	cv;
+
+    memset(buf, 0, buflen);
+	cv.cv_srcDesc.ds_dataType = dt;
+	cv.cv_srcDesc.ds_nullable = FALSE;
+	cv.cv_srcDesc.ds_length = len;
+	cv.cv_srcDesc.ds_precision = 0;
+	cv.cv_srcDesc.ds_scale = 0;
+	cv.cv_srcDesc.ds_columnType = IIAPI_COL_TUPLE;
+	cv.cv_srcDesc.ds_columnName = NULL;
+
+	cv.cv_srcValue.dv_null = FALSE;
+	cv.cv_srcValue.dv_length = cv.cv_srcDesc.ds_length;
+	cv.cv_srcValue.dv_value = val;
+
+	cv.cv_dstDesc.ds_dataType = IIAPI_CHA_TYPE;
+	cv.cv_dstDesc.ds_nullable = FALSE;
+	cv.cv_dstDesc.ds_length = buflen;
+	cv.cv_dstDesc.ds_precision = 0;
+	cv.cv_dstDesc.ds_scale = 0;
+	cv.cv_dstDesc.ds_columnType = IIAPI_COL_TUPLE;
+	cv.cv_dstDesc.ds_columnName = NULL;
+
+	cv.cv_dstValue.dv_null = FALSE;
+	cv.cv_dstValue.dv_length = cv.cv_dstDesc.ds_length;
+	cv.cv_dstValue.dv_value = buf;
+
+    IIapi_convertData(&cv);
+
+    return cv.cv_status;
+}
+
+//examples - common/aif/demo/api**.c
 
 */
 import "C"
@@ -121,10 +157,33 @@ type rows struct {
 	rowsAffected int64
 }
 
+type QueryType uint
+
+const (
+	SELECT         QueryType = C.IIAPI_QT_QUERY
+	SELECT_ONE     QueryType = C.IIAPI_QT_SELECT_SINGLETON
+	EXEC           QueryType = C.IIAPI_QT_EXEC
+	OPEN           QueryType = C.IIAPI_QT_OPEN
+	EXEC_PROCEDURE QueryType = C.IIAPI_QT_EXEC_PROCEDURE
+)
+
+type stmt struct {
+	conn        *OpenAPIConn
+	query       string
+	queryType   QueryType
+	transaction *OpenAPITransaction
+}
+
 var (
 	bufferPool = sync.Pool{
 		New: func() any {
 			return new(bytes.Buffer)
+		},
+	}
+
+	smallBytesPool = sync.Pool{
+		New: func() any {
+			return make([]byte, 100)
 		},
 	}
 
@@ -334,23 +393,6 @@ func wait(genParm *C.IIAPI_GENPARM) {
 			break
 		}
 	}
-}
-
-type QueryType uint
-
-const (
-	SELECT         QueryType = C.IIAPI_QT_QUERY
-	SELECT_ONE     QueryType = C.IIAPI_QT_SELECT_SINGLETON
-	EXEC           QueryType = C.IIAPI_QT_EXEC
-	OPEN           QueryType = C.IIAPI_QT_OPEN
-	EXEC_PROCEDURE QueryType = C.IIAPI_QT_EXEC_PROCEDURE
-)
-
-type stmt struct {
-	conn        *OpenAPIConn
-	query       string
-	queryType   QueryType
-	transaction *OpenAPITransaction
 }
 
 func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error) {
@@ -769,11 +811,11 @@ func (rs *rows) Close() error {
 			block.cols = nil
 		}
 
-        // reuse buffers
-        if block.buffer != nil {
-            bufferPool.Put(block.buffer)
-            block.buffer = nil
-        }
+		// reuse buffers
+		if block.buffer != nil {
+			bufferPool.Put(block.buffer)
+			block.buffer = nil
+		}
 	}
 
 	return err
@@ -809,10 +851,10 @@ func (rs *rows) fetchData() error {
 			if block.segmented {
 				sz := block.cols.dv_length
 
-                // first 2 two bytes contain the size, but we need all content
-                if sz > 2 {
-				    block.buffer.Write(rs.vals[block.colIndex][2:sz])
-                }
+				// first 2 two bytes contain the size, but we need all content
+				if sz > 2 {
+					block.buffer.Write(rs.vals[block.colIndex][2:sz])
+				}
 			}
 
 			if getColParm.gc_moreSegments == 0 {
@@ -851,6 +893,14 @@ func (rs *rows) fetchInfo() error {
 	return err
 }
 
+func shrinkStr(res string) string {
+	return strings.TrimRight(res, "\x00")
+}
+
+func shrinkStrWithBlanks(res string) string {
+	return strings.TrimRight(res, "\x00 ")
+}
+
 func decode(col *columnDesc, val []byte) (driver.Value, error) {
 	var res driver.Value
 	switch col.ingDataType {
@@ -875,17 +925,17 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			res = math.Float64frombits(bits)
 		}
 	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
-		res = strings.TrimRight(string(val), "\x00")
+		res = shrinkStr(string(val))
 	case C.IIAPI_LVCH_TYPE, C.IIAPI_LTXT_TYPE:
 		if col.block == nil {
 			return nil, errors.New("internal: long types should have a link to column block")
 		}
 
-        // TODO: optimize here, shrink at the end for \0
+		// TODO: optimize here, shrink at the end for \0
 		val = col.block.buffer.Bytes()
-		res = strings.TrimRight(string(val), "\x00")
+		res = shrinkStr(string(val))
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
-		res = strings.TrimRight(string(val[2:]), "\x00")
+		res = shrinkStr(string(val[2:]))
 	case C.IIAPI_BOOL_TYPE:
 		res = (val[0] == 1)
 	case C.IIAPI_VBYTE_TYPE:
@@ -907,7 +957,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			out[i] = nativeEndian.Uint16(val[i*2:])
 		}
 		res = string(utf16.Decode(out))
-		res = strings.TrimRight(res.(string), "\x00")
+		res = shrinkStr(res.(string))
 	case C.IIAPI_LNVCH_TYPE:
 		val = col.block.buffer.Bytes()
 		out := make([]uint16, len(val)/2)
@@ -915,10 +965,44 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			out[i] = nativeEndian.Uint16(val[i*2:])
 		}
 		res = string(utf16.Decode(out))
-		res = strings.TrimRight(res.(string), "\x00")
+		res = shrinkStr(res.(string))
+	case
+		C.IIAPI_DTE_TYPE,   /* Ingres Date */
+		C.IIAPI_DATE_TYPE,  /* ANSI Date */
+		C.IIAPI_TIME_TYPE,  /* Ingres Time */
+		C.IIAPI_TMWO_TYPE,  /* Time without Timezone */
+		C.IIAPI_TMTZ_TYPE,  /* Time with Timezone */
+		C.IIAPI_TS_TYPE,    /* Ingres Timestamp */
+		C.IIAPI_TSWO_TYPE,  /* Timestamp without Timezone */
+		C.IIAPI_TSTZ_TYPE,  /* Timestamp with Timezone */
+		C.IIAPI_INTYM_TYPE, /* Interval Year to Month */
+		C.IIAPI_INTDS_TYPE: /* Interval Day to Second */
+		var err error
+
+		res, err = convertToStr(col, val)
+		if err != nil {
+			return nil, err
+		}
+		res = shrinkStrWithBlanks(res.(string))
 	default:
 		return nil, errors.New("type is not supported")
 	}
+
+	return res, nil
+}
+
+func convertToStr(cd *columnDesc, val []byte) (string, error) {
+	var destBuf = smallBytesPool.Get().([]byte)
+
+	status := C.convertToStr(cd.ingDataType, C.II_PTR(&val[0]), C.ushort(len(val)),
+		C.II_PTR(&destBuf[0]), C.ushort(len(destBuf)))
+
+	if status != C.IIAPI_ST_SUCCESS {
+		return "", errors.New("convertation error")
+	}
+
+	res := string(destBuf)
+	smallBytesPool.Put(destBuf)
 
 	return res, nil
 }
