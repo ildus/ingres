@@ -810,7 +810,9 @@ func (rs *rows) fetchData() error {
 				sz := block.cols.dv_length
 
                 // first 2 two bytes contain the size, but we need all content
-				block.buffer.Write(rs.vals[block.colIndex][2:sz])
+                if sz > 2 {
+				    block.buffer.Write(rs.vals[block.colIndex][2:sz])
+                }
 			}
 
 			if getColParm.gc_moreSegments == 0 {

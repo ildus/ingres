@@ -198,7 +198,9 @@ func TestLongVarchar(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = conn.Exec("insert into test_long values (3, repeat('b', 12345), 4)", nil)
+	require.NoError(t, err)
 
+	_, err = conn.Exec("insert into test_long values (3, 'a', 4)", nil)
 	require.NoError(t, err)
 
 	rows, err := conn.Query(`select * from test_long`, nil)
@@ -206,6 +208,8 @@ func TestLongVarchar(t *testing.T) {
 	defer rows.Close()
 
 	dest := make([]driver.Value, len(rows.Columns()))
+
+    // 1st line
 	err = rows.Next(dest)
 	require.NoError(t, err)
 
@@ -218,6 +222,7 @@ func TestLongVarchar(t *testing.T) {
 	}
 	require.Equal(t, dest[2].(int32), int32(2))
 
+    // 2nd line
 	err = rows.Next(dest)
 	require.NoError(t, err)
 	require.Equal(t, dest[0].(int32), int32(3))
@@ -227,6 +232,16 @@ func TestLongVarchar(t *testing.T) {
 	for i := 0; i < len(res); i++ {
 		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
 	}
+	require.Equal(t, dest[2].(int32), int32(4))
+
+    // 3rd line
+	err = rows.Next(dest)
+	require.NoError(t, err)
+	require.Equal(t, dest[0].(int32), int32(3))
+
+	res = dest[1].(string)
+	assert.Equal(t, 1, len(res))
+	assert.Equal(t, "a", res)
 	require.Equal(t, dest[2].(int32), int32(4))
 }
 
