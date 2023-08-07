@@ -890,10 +890,24 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		res = val[2:]
 	case C.IIAPI_BYTE_TYPE:
 		res = val
+	case C.IIAPI_LBYTE_TYPE:
+		if col.block == nil {
+			return nil, errors.New("internal: long types should have a link to column block")
+		}
+
+		res = col.block.buffer.Bytes()
 	case C.IIAPI_NVCH_TYPE:
 		val = val[2:]
 		fallthrough
 	case C.IIAPI_NCHA_TYPE:
+		out := make([]uint16, len(val)/2)
+		for i := range out {
+			out[i] = nativeEndian.Uint16(val[i*2:])
+		}
+		res = string(utf16.Decode(out))
+		res = strings.TrimRight(res.(string), "\x00")
+	case C.IIAPI_LNVCH_TYPE:
+		val = col.block.buffer.Bytes()
 		out := make([]uint16, len(val)/2)
 		for i := range out {
 			out[i] = nativeEndian.Uint16(val[i*2:])

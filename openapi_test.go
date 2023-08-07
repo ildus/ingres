@@ -180,7 +180,7 @@ func TestDecode(t *testing.T) {
 	assert.Equal(t, "bbb", dest[15].(string))
 }
 
-func TestLong(t *testing.T) {
+func TestLongVarchar(t *testing.T) {
 	conn, deinit := testconn(t)
 	defer deinit()
 
@@ -223,6 +223,106 @@ func TestLong(t *testing.T) {
 	require.Equal(t, dest[0].(int32), int32(3))
 
 	res = dest[1].(string)
+	assert.Equal(t, 12345, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(4))
+}
+
+func TestLongNVarchar(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, err = conn.Exec("drop table if exists test_long", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("create table test_long(a int, b long nvarchar, c int)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (1, repeat('a', 10000), 2)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (3, repeat('b', 12345), 4)", nil)
+
+	require.NoError(t, err)
+
+	rows, err := conn.Query(`select * from test_long`, nil)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(dest)
+	require.NoError(t, err)
+
+	require.Equal(t, dest[0].(int32), int32(1))
+
+	res := dest[1].(string)
+	assert.Equal(t, 10000, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'a', rune(res[i]), fmt.Sprintf(`at location %d expected 'a'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(2))
+
+	err = rows.Next(dest)
+	require.NoError(t, err)
+	require.Equal(t, dest[0].(int32), int32(3))
+
+	res = dest[1].(string)
+	assert.Equal(t, 12345, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(4))
+}
+
+func TestLongBytes(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, err = conn.Exec("drop table if exists test_long", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("create table test_long(a int, b long byte, c int)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (1, repeat('a', 10000), 2)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (3, repeat('b', 12345), 4)", nil)
+
+	require.NoError(t, err)
+
+	rows, err := conn.Query(`select * from test_long`, nil)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(dest)
+	require.NoError(t, err)
+
+	require.Equal(t, dest[0].(int32), int32(1))
+
+	res := dest[1].([]byte)
+	assert.Equal(t, 10000, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'a', rune(res[i]), fmt.Sprintf(`at location %d expected 'a'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(2))
+
+	err = rows.Next(dest)
+	require.NoError(t, err)
+	require.Equal(t, dest[0].(int32), int32(3))
+
+	res = dest[1].([]byte)
 	assert.Equal(t, 12345, len(res))
 	for i := 0; i < len(res); i++ {
 		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
