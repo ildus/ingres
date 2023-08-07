@@ -24,6 +24,11 @@ static inline void set_dv_value(IIAPI_DATAVALUE *dest, int i, void *val)
     dest[i].dv_value = val;
 }
 
+static inline void set_dv_length(IIAPI_DATAVALUE *dest, int i, short len)
+{
+    dest[i].dv_length = len;
+}
+
 //common/aif/demo/apiautil.c
 
 */
@@ -77,11 +82,23 @@ type columnDesc struct {
 	length      uint16
 	precision   int16
 	scale       int16
+
+	block *colBlock
 }
 
 type rowsHeader struct {
 	colNames []string
 	colTyps  []columnDesc
+}
+
+// part of Columns to get
+type colBlock struct {
+	colIndex  uint16
+	segmented bool
+	count     uint16
+	cols      *C.IIAPI_DATAVALUE
+
+	buffer *bytes.Buffer
 }
 
 type rows struct {
@@ -97,18 +114,16 @@ type rows struct {
 	done   bool
 	result driver.Result
 
-	cols *C.IIAPI_DATAVALUE
-	vals [][]byte
+	vals      [][]byte
+	colBlocks []*colBlock
 
 	lastInsertId int64
 	rowsAffected int64
-
-	getColParm C.IIAPI_GETCOLPARM
 }
 
 var (
 	bufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return new(bytes.Buffer)
 		},
 	}
@@ -389,7 +404,6 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 
 		res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
 		res.colNames = make([]string, getDescrParm.gd_descriptorCount)
-		res.cols = C.allocate_cols(getDescrParm.gd_descriptorCount)
 		res.vals = make([][]byte, len(res.colTyps))
 
 		for i := 0; i < len(res.colTyps); i++ {
@@ -402,15 +416,58 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 
 			res.colNames[i] = C.GoString(descr.ds_columnName)
 			res.vals[i] = make([]byte, res.colTyps[i].length)
-			C.set_dv_value(res.cols, C.int(i), unsafe.Pointer(&res.vals[i][0]))
 		}
-		res.getColParm.gc_genParm.gp_callback = nil
-		res.getColParm.gc_genParm.gp_closure = nil
-		res.getColParm.gc_rowCount = 1
-		res.getColParm.gc_columnCount = getDescrParm.gd_descriptorCount
-		res.getColParm.gc_columnData = res.cols
-		res.getColParm.gc_stmtHandle = res.stmtHandle
-		res.getColParm.gc_moreSegments = 0
+
+		newColBlock := func(start, end uint16, segmented bool) *colBlock {
+			var i uint16
+
+			count := end - start + 1
+			if count <= 0 {
+				return nil
+			}
+
+			block := &colBlock{
+				count:     count,
+				cols:      C.allocate_cols(C.short(count)),
+				segmented: segmented,
+			}
+
+			// save link to the block for decoding
+
+			if segmented {
+				block.colIndex = start
+				block.buffer = bufferPool.Get().(*bytes.Buffer)
+				res.colTyps[start].block = block
+			}
+
+			for i = 0; i < count; i++ {
+				j := start + i
+				C.set_dv_length(block.cols, C.int(i), C.short(res.colTyps[i].length))
+				C.set_dv_value(block.cols, C.int(i), unsafe.Pointer(&res.vals[j][0]))
+			}
+			return block
+		}
+
+		var start = uint16(0)
+		var current = uint16(0)
+
+		for current < uint16(len(res.colTyps)) {
+			if res.colTyps[current].isLongType() {
+				b := newColBlock(start, current-1, false)
+				if b != nil {
+					res.colBlocks = append(res.colBlocks, b)
+				}
+
+				res.colBlocks = append(res.colBlocks, newColBlock(current, current, true))
+				start = current + 1
+			}
+			current += 1
+		}
+
+		b := newColBlock(start, current-1, false)
+		if b != nil {
+			res.colBlocks = append(res.colBlocks, b)
+		}
 	}
 
 	return res, nil
@@ -517,6 +574,19 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 	}
 
 	return err
+}
+
+func (c *columnDesc) isLongType() bool {
+	switch c.ingDataType {
+	case
+		C.IIAPI_LVCH_TYPE,
+		C.IIAPI_LNVCH_TYPE,
+		C.IIAPI_LTXT_TYPE,
+		C.IIAPI_LBYTE_TYPE:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *columnDesc) getType() reflect.Type {
@@ -692,9 +762,18 @@ func (rs *rows) Close() error {
 
 	err := rs.closeStmt()
 
-	if rs.cols != nil {
-		C.free(unsafe.Pointer(rs.cols))
-		rs.cols = nil
+	// free C allocated arrays
+	for _, block := range rs.colBlocks {
+		if block.cols != nil {
+			C.free(unsafe.Pointer(block.cols))
+			block.cols = nil
+		}
+
+        // reuse buffers
+        if block.buffer != nil {
+            bufferPool.Put(block.buffer)
+            block.buffer = nil
+        }
 	}
 
 	return err
@@ -702,20 +781,50 @@ func (rs *rows) Close() error {
 
 func (rs *rows) fetchData() error {
 	var err error
+	var getColParm C.IIAPI_GETCOLPARM
 
-	C.IIapi_getColumns(&rs.getColParm)
-	wait(&rs.getColParm.gc_genParm)
-	err = checkError("IIapi_getColumns()", &rs.getColParm.gc_genParm)
-	if err != nil {
-		return err
+	for _, block := range rs.colBlocks {
+		if block.segmented {
+			block.buffer.Reset()
+		}
+
+		getColParm.gc_genParm.gp_callback = nil
+		getColParm.gc_genParm.gp_closure = nil
+		getColParm.gc_rowCount = 1
+		getColParm.gc_columnCount = C.short(block.count)
+		getColParm.gc_columnData = block.cols
+		getColParm.gc_stmtHandle = rs.stmtHandle
+
+		for {
+			getColParm.gc_moreSegments = 0
+
+			C.IIapi_getColumns(&getColParm)
+			wait(&getColParm.gc_genParm)
+			err = checkError("IIapi_getColumns()", &getColParm.gc_genParm)
+
+			if err != nil {
+				return err
+			}
+
+			if block.segmented {
+				sz := block.cols.dv_length
+
+                // first 2 two bytes contain the size, but we need all content
+				block.buffer.Write(rs.vals[block.colIndex][2:sz])
+			}
+
+			if getColParm.gc_moreSegments == 0 {
+				break
+			}
+		}
 	}
 
-	if rs.getColParm.gc_genParm.gp_status == C.IIAPI_ST_NO_DATA {
+	if getColParm.gc_genParm.gp_status == C.IIAPI_ST_NO_DATA {
 		rs.done = true
 	}
 
 	if rs.done {
-		rs.fetchInfo()
+		err = rs.fetchInfo()
 	}
 
 	return err
@@ -765,10 +874,14 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		}
 	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
 		res = strings.TrimRight(string(val), "\x00")
-	case C.IIAPI_LVCH_TYPE:
-		fallthrough
-	case C.IIAPI_LTXT_TYPE:
-		fallthrough
+	case C.IIAPI_LVCH_TYPE, C.IIAPI_LTXT_TYPE:
+		if col.block == nil {
+			return nil, errors.New("internal: long types should have a link to column block")
+		}
+
+        // TODO: optimize here, shrink at the end for \0
+		val = col.block.buffer.Bytes()
+		res = strings.TrimRight(string(val), "\x00")
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
 		res = strings.TrimRight(string(val[2:]), "\x00")
 	case C.IIAPI_BOOL_TYPE:
@@ -795,7 +908,10 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 }
 
 func (rs *rows) Next(dest []driver.Value) (err error) {
-	rs.fetchData()
+	err = rs.fetchData()
+	if err != nil {
+		return err
+	}
 
 	if rs.done {
 		return io.EOF

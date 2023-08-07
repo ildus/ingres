@@ -1,12 +1,12 @@
 package ingres
 
 import (
+	"database/sql/driver"
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
 	"testing"
-
-	"database/sql/driver"
 )
 
 func TestInitOpenAPI(t *testing.T) {
@@ -178,4 +178,54 @@ func TestDecode(t *testing.T) {
 	assert.Equal(t, []byte("bb"), dest[13].([]byte))
 	assert.Equal(t, "aaa", dest[14].(string))
 	assert.Equal(t, "bbb", dest[15].(string))
+}
+
+func TestLong(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, err = conn.Exec("drop table if exists test_long", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("create table test_long(a int, b long varchar, c int)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (1, repeat('a', 10000), 2)", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("insert into test_long values (3, repeat('b', 12345), 4)", nil)
+
+	require.NoError(t, err)
+
+	rows, err := conn.Query(`select * from test_long`, nil)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(dest)
+	require.NoError(t, err)
+
+	require.Equal(t, dest[0].(int32), int32(1))
+
+	res := dest[1].(string)
+	assert.Equal(t, 10000, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'a', rune(res[i]), fmt.Sprintf(`at location %d expected 'a'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(2))
+
+	err = rows.Next(dest)
+	require.NoError(t, err)
+	require.Equal(t, dest[0].(int32), int32(3))
+
+	res = dest[1].(string)
+	assert.Equal(t, 12345, len(res))
+	for i := 0; i < len(res); i++ {
+		assert.Equal(t, 'b', rune(res[i]), fmt.Sprintf(`at location %d expected 'b'`, i))
+	}
+	require.Equal(t, dest[2].(int32), int32(4))
 }
