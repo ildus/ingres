@@ -359,7 +359,11 @@ func (c *OpenAPIConn) AutoCommit() error {
 func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if c.currentTransaction != nil {
 		if c.currentTransaction.autocommit {
-			return nil, fmt.Errorf("%s", "autocommit is enabled")
+            err := c.DisableAutoCommit()
+
+            if err != nil {
+                return nil, err
+            }
 		} else {
 			return nil, fmt.Errorf("%s", "already in transaction")
 		}
