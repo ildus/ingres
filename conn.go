@@ -130,18 +130,24 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.runQuery(s.conn.handle, s.conn.currentTransaction.handle)
 }
 
-func (s *stmt) Close() error {
-	return nil
-}
-
 func (s *stmt) NumInput() int {
 	return -1
 }
 
 func (t *OpenAPITransaction) Commit() error {
-	return commitTransaction(t.handle)
+    err := commitTransaction(t.handle)
+    if err == nil {
+        t.conn.currentTransaction = nil
+        t.conn.AutoCommit()
+    }
+    return err
 }
 
 func (t *OpenAPITransaction) Rollback() error {
-	return rollbackTransaction(t.handle)
+    err := rollbackTransaction(t.handle)
+    if err == nil {
+        t.conn.currentTransaction = nil
+        t.conn.AutoCommit()
+    }
+    return err
 }

@@ -149,7 +149,6 @@ type rows struct {
 	transactionCreated bool
 
 	transHandle C.II_PTR
-	stmtHandle  C.II_PTR
 	queryType   QueryType
 
 	finish func()
@@ -187,6 +186,7 @@ type stmt struct {
 	query       string
 	queryType   QueryType
 	transaction *OpenAPITransaction
+	stmtHandle  C.II_PTR
 }
 
 var (
@@ -359,11 +359,11 @@ func (c *OpenAPIConn) AutoCommit() error {
 func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if c.currentTransaction != nil {
 		if c.currentTransaction.autocommit {
-            err := c.DisableAutoCommit()
+			err := c.DisableAutoCommit()
 
-            if err != nil {
-                return nil, err
-            }
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			return nil, fmt.Errorf("%s", "already in transaction")
 		}
@@ -438,9 +438,9 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 		stmt:               s,
 		transactionCreated: transHandle == nil,
 		transHandle:        queryParm.qy_tranHandle,
-		stmtHandle:         queryParm.qy_stmtHandle,
 	}
 
+    s.stmtHandle = queryParm.qy_stmtHandle
 	s.transaction = &OpenAPITransaction{
 		handle: queryParm.qy_tranHandle,
 		conn:   s.conn,
@@ -450,7 +450,7 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 	if s.queryType != EXEC {
 		getDescrParm.gd_genParm.gp_callback = nil
 		getDescrParm.gd_genParm.gp_closure = nil
-		getDescrParm.gd_stmtHandle = res.stmtHandle
+		getDescrParm.gd_stmtHandle = s.stmtHandle
 		getDescrParm.gd_descriptorCount = 0
 		getDescrParm.gd_descriptor = nil
 
@@ -806,18 +806,24 @@ func (c *columnDesc) Length() (int64, bool) {
 	return val, true
 }
 
-func (rs *rows) closeStmt() error {
-	var closeParm C.IIAPI_CLOSEPARM
+func (s *stmt) Close() error {
+    if s.stmtHandle != nil {
+        var closeParm C.IIAPI_CLOSEPARM
 
-	closeParm.cl_genParm.gp_callback = nil
-	closeParm.cl_genParm.gp_closure = nil
-	closeParm.cl_stmtHandle = rs.stmtHandle
+        closeParm.cl_genParm.gp_callback = nil
+        closeParm.cl_genParm.gp_closure = nil
+        closeParm.cl_stmtHandle = s.stmtHandle
 
-	C.IIapi_close(&closeParm)
-	wait(&closeParm.cl_genParm)
-	err := checkError("IIapi_close()", &closeParm.cl_genParm)
+        C.IIapi_close(&closeParm)
+        wait(&closeParm.cl_genParm)
+        err := checkError("IIapi_close()", &closeParm.cl_genParm)
 
-	return err
+        s.stmtHandle = nil
+
+        return err
+    }
+
+	return nil
 }
 
 func (rs *rows) Close() error {
@@ -825,7 +831,7 @@ func (rs *rows) Close() error {
 		defer finish()
 	}
 
-	err := rs.closeStmt()
+	err := rs.stmt.Close()
 
 	// free C allocated arrays
 	for _, block := range rs.colBlocks {
@@ -848,9 +854,9 @@ func (rs *rows) fetchData() error {
 	var err error
 	var getColParm C.IIAPI_GETCOLPARM
 
-    for i := 0; i < len(rs.nulls); i++ {
-        rs.nulls[i] = false
-    }
+	for i := 0; i < len(rs.nulls); i++ {
+		rs.nulls[i] = false
+	}
 
 	for _, block := range rs.colBlocks {
 		if block.segmented {
@@ -862,7 +868,7 @@ func (rs *rows) fetchData() error {
 		getColParm.gc_rowCount = 1
 		getColParm.gc_columnCount = C.short(block.count)
 		getColParm.gc_columnData = block.cols
-		getColParm.gc_stmtHandle = rs.stmtHandle
+		getColParm.gc_stmtHandle = rs.stmt.stmtHandle
 
 		for {
 			getColParm.gc_moreSegments = 0
@@ -877,10 +883,10 @@ func (rs *rows) fetchData() error {
 
 			var i uint16
 			for i = 0; i < block.count; i++ {
-                dv := C.get_dv(block.cols, C.ushort(i))
-                if (dv.dv_null == 1) {
-                    *block.nulls[i] = true;
-                }
+				dv := C.get_dv(block.cols, C.ushort(i))
+				if dv.dv_null == 1 {
+					*block.nulls[i] = true
+				}
 			}
 
 			if block.segmented {
@@ -917,17 +923,20 @@ func (rs *rows) fetchInfo() error {
 	/* Get fetch result info */
 	getQInfoParm.gq_genParm.gp_callback = nil
 	getQInfoParm.gq_genParm.gp_closure = nil
-	getQInfoParm.gq_stmtHandle = rs.stmtHandle
+	getQInfoParm.gq_stmtHandle = rs.stmt.stmtHandle
 
 	info := &getQInfoParm
 	C.IIapi_getQueryInfo(info)
 	wait(&info.gq_genParm)
 	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
-		rs.rowsAffected = int64(info.gq_rowCountEx)
+		rs.Close()
+
+		return err
 	}
 
-	return err
+	rs.rowsAffected = int64(info.gq_rowCountEx)
+	return nil
 }
 
 func shrinkStr(res string) string {
@@ -1055,10 +1064,10 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 	}
 
 	for i, val := range rs.vals {
-        if rs.nulls[i] {
-            dest[i] = nil
-            continue
-        }
+		if rs.nulls[i] {
+			dest[i] = nil
+			continue
+		}
 
 		dest[i], err = decode(&rs.colTyps[i], val)
 		if err != nil {
