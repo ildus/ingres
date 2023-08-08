@@ -1,6 +1,7 @@
 package ingres
 
 import (
+    "database/sql"
 	"database/sql/driver"
 	"fmt"
 	"github.com/stretchr/testify/assert"
@@ -402,4 +403,67 @@ func TestDates(t *testing.T) {
 	assert.Equal(t, dest[7].(string), "2008-12-15 12:30:55")
 	assert.Equal(t, dest[8].(string), "55-04")
 	assert.Equal(t, dest[9].(string), "-18 12:02:23")
+}
+
+func TestNull(t *testing.T) {
+    conn, err := sql.Open("ingres", "mydb")
+	require.NoError(t, err)
+    defer conn.Close()
+
+	_, err = conn.Exec("drop table if exists test_null", nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`create table test_null(
+        d1 int null,
+        d2 varchar(10) null,
+        d3 int not null
+    )`, nil)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`insert into test_null values
+        (null, 'asdf', 1),
+        (1, null, 2),
+        (null, null, 3),
+        (2, 'hkll', 4)
+    `, nil)
+	require.NoError(t, err)
+
+	rows, err := conn.Query(`select * from test_null`, nil)
+	require.NoError(t, err)
+	defer rows.Close()
+
+    var intval sql.NullInt32
+    var strval sql.NullString
+    var int2val int
+
+    rows.Next()
+    err = rows.Scan(&intval, &strval, &int2val)
+	require.NoError(t, err)
+    assert.False(t, intval.Valid)
+    assert.True(t, strval.Valid)
+    assert.Equal(t, 1, int2val)
+
+    rows.Next()
+    err = rows.Scan(&intval, &strval, &int2val)
+	require.NoError(t, err)
+    assert.True(t, intval.Valid)
+    assert.False(t, strval.Valid)
+    assert.Equal(t, 2, int2val)
+
+    rows.Next()
+    err = rows.Scan(&intval, &strval, &int2val)
+	require.NoError(t, err)
+    assert.False(t, intval.Valid)
+    assert.False(t, strval.Valid)
+    assert.Equal(t, 3, int2val)
+
+    rows.Next()
+    err = rows.Scan(&intval, &strval, &int2val)
+	require.NoError(t, err)
+    assert.True(t, intval.Valid)
+    assert.True(t, strval.Valid)
+    assert.Equal(t, 4, int2val)
+
+    require.False(t, rows.Next())
+	require.NoError(t, rows.Err())
 }

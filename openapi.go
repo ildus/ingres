@@ -4,6 +4,7 @@ package ingres
 #cgo pkg-config: iiapi
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <iiapi.h>
 
@@ -25,12 +26,17 @@ static inline void set_dv_value(IIAPI_DATAVALUE *dest, int i, void *val)
     dest[i].dv_value = val;
 }
 
-static inline void set_dv_length(IIAPI_DATAVALUE *dest, int i, short len)
+static inline void set_dv_length(IIAPI_DATAVALUE *dest, int i, uint16_t len)
 {
     dest[i].dv_length = len;
 }
 
-static IIAPI_STATUS convertToStr(IIAPI_DT_ID dt, II_PTR val, ushort len,
+static inline IIAPI_DATAVALUE * get_dv(IIAPI_DATAVALUE *dest, uint16_t i)
+{
+    return &dest[i];
+}
+
+static IIAPI_STATUS convertToStr(IIAPI_DT_ID dt, II_PTR val, uint16_t len,
     II_PTR buf, ushort buflen)
 {
     IIAPI_CONVERTPARM	cv;
@@ -132,7 +138,8 @@ type colBlock struct {
 	colIndex  uint16
 	segmented bool
 	count     uint16
-	cols      *C.IIAPI_DATAVALUE
+	cols      *C.IIAPI_DATAVALUE // dv_value will point to vals[x] in rows.vals
+	nulls     []*bool            // items will point to nulls[x] in rows.nulls
 
 	buffer *bytes.Buffer
 }
@@ -150,7 +157,15 @@ type rows struct {
 	done   bool
 	result driver.Result
 
-	vals      [][]byte
+	vals  [][]byte // byte buffers where API writes results
+	nulls []bool
+
+	/* if one or more of the columns is long we have to get columns by parts,
+	   for example we have 10 columns, and 5th is long varchar, then
+	   we will have three column blocks - (1-4, 5, 6-10) - it means
+	   we get first 4 columns, then read segments of 5 until it's completed,
+	   and then blocks 6-10
+	*/
 	colBlocks []*colBlock
 
 	lastInsertId int64
@@ -447,6 +462,7 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 		res.colTyps = make([]columnDesc, getDescrParm.gd_descriptorCount)
 		res.colNames = make([]string, getDescrParm.gd_descriptorCount)
 		res.vals = make([][]byte, len(res.colTyps))
+		res.nulls = make([]bool, len(res.colTyps))
 
 		for i := 0; i < len(res.colTyps); i++ {
 			descr := C.get_descr(&getDescrParm, C.ulong(i))
@@ -458,6 +474,7 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 
 			res.colNames[i] = C.GoString(descr.ds_columnName)
 			res.vals[i] = make([]byte, res.colTyps[i].length)
+			res.nulls[i] = false
 		}
 
 		newColBlock := func(start, end uint16, segmented bool) *colBlock {
@@ -472,6 +489,7 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 				count:     count,
 				cols:      C.allocate_cols(C.short(count)),
 				segmented: segmented,
+				nulls:     make([]*bool, count),
 			}
 
 			// save link to the block for decoding
@@ -484,8 +502,9 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 
 			for i = 0; i < count; i++ {
 				j := start + i
-				C.set_dv_length(block.cols, C.int(i), C.short(res.colTyps[i].length))
+				C.set_dv_length(block.cols, C.int(i), C.uint16_t(res.colTyps[i].length))
 				C.set_dv_value(block.cols, C.int(i), unsafe.Pointer(&res.vals[j][0]))
+				block.nulls[i] = &res.nulls[j]
 			}
 			return block
 		}
@@ -825,6 +844,10 @@ func (rs *rows) fetchData() error {
 	var err error
 	var getColParm C.IIAPI_GETCOLPARM
 
+    for i := 0; i < len(rs.nulls); i++ {
+        rs.nulls[i] = false
+    }
+
 	for _, block := range rs.colBlocks {
 		if block.segmented {
 			block.buffer.Reset()
@@ -848,7 +871,17 @@ func (rs *rows) fetchData() error {
 				return err
 			}
 
+			var i uint16
+			for i = 0; i < block.count; i++ {
+                dv := C.get_dv(block.cols, C.ushort(i))
+                if (dv.dv_null == 1) {
+                    *block.nulls[i] = true;
+                }
+			}
+
 			if block.segmented {
+				// we can do this because for segmented there is only one
+				// column in colBlock
 				sz := block.cols.dv_length
 
 				// first 2 two bytes contain the size, but we need all content
@@ -1018,6 +1051,11 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 	}
 
 	for i, val := range rs.vals {
+        if rs.nulls[i] {
+            dest[i] = nil
+            continue
+        }
+
 		dest[i], err = decode(&rs.colTyps[i], val)
 		if err != nil {
 			return err

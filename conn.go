@@ -108,9 +108,9 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	}
 
 	err = rows.fetchInfo()
-    if err != nil {
-        return nil, err
-    }
+	if err != nil {
+		return nil, err
+	}
 
 	err = rows.Close()
 	if err != nil {
