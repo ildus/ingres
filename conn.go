@@ -77,7 +77,7 @@ func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
 }
 
 func (c *OpenAPIConn) Query(query string, args []driver.Value) (driver.Rows, error) {
-	s := makeStmt(c, query, SELECT)
+	s := makeStmt(c, query, QUERY)
 	return s.Query(args)
 }
 
@@ -87,7 +87,7 @@ func (c *OpenAPIConn) Exec(query string, args []driver.Value) (driver.Result, er
 }
 
 func (c *OpenAPIConn) Prepare(query string) (driver.Stmt, error) {
-	return makeStmt(c, query, SELECT), nil
+	return makeStmt(c, query, QUERY), nil
 }
 
 func (c *OpenAPIConn) Begin() (driver.Tx, error) {
@@ -126,7 +126,7 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 }
 
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
-	s.queryType = SELECT
+	s.queryType = QUERY
 	s.args = args
 
 	if s.conn.currentTransaction == nil {

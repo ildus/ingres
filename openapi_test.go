@@ -468,31 +468,75 @@ func TestNull(t *testing.T) {
 	require.NoError(t, rows.Err())
 }
 
-func TestPrepare(t *testing.T) {
+func TestArgs(t *testing.T) {
 	conn, err := sql.Open("ingres", "mydb")
 	require.NoError(t, err)
 	defer conn.Close()
 
-	_, err = conn.Exec("drop table if exists test_prepare")
+	_, err = conn.Exec("drop table if exists test_args")
 	require.NoError(t, err)
 
-	_, err = conn.Exec(`create table test_prepare(
+	_, err = conn.Exec(`create table test_args(
         d1 int null,
         d2 varchar(10) null,
-        d3 int not null
+        d3 int not null,
+        d4 float4,
+        d5 float8
     )`)
 	require.NoError(t, err)
 
-	stmt, err := conn.Prepare(`insert into test_prepare values (?, ?, ?`)
+	res, err := conn.Exec(`insert into test_args values ( ~V , ~V , ~V , ~V , ~V )`,
+        1, "aaa", 2, 0.1, 0.2)
 	require.NoError(t, err)
 
-	res, err := stmt.Exec(1, "asdf", 2)
+	stmt, err := conn.Prepare(`insert into test_args values ( ~V , ~V , ~V , ~V , ~V )`)
+	require.NoError(t, err)
+
+    res, err = stmt.Exec(3, "bbb", 4, 1.1, 2.2)
+	require.NoError(t, err)
+
+    res, err = stmt.Exec(3, "ccc", 4, 3.3, 4.4)
 	require.NoError(t, err)
 
 	cnt, err := res.RowsAffected()
 	require.NoError(t, err)
-	assert.Equal(t, cnt, 1)
+	assert.Equal(t, int64(1), cnt)
 
-	_, err = conn.Exec("drop table if exists test_prepare")
+    rows, err := conn.Query("select * from test_args")
+    defer rows.Close()
+
+	var intval sql.NullInt32
+	var strval sql.NullString
+	var int2val int
+	var f1 float32
+	var f2 float64
+
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val, &f1, &f2)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), intval.Int32)
+	assert.Equal(t, "aaa", strval.String)
+	assert.Equal(t, 2, int2val)
+	assert.Equal(t, float32(0.1), f1)
+	assert.Equal(t, 0.2, f2)
+
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val, &f1, &f2)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), intval.Int32)
+	assert.Equal(t, "bbb", strval.String)
+	assert.Equal(t, 4, int2val)
+
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val, &f1, &f2)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), intval.Int32)
+	assert.Equal(t, "ccc", strval.String)
+	assert.Equal(t, 4, int2val)
+
+	require.False(t, rows.Next())
+	require.NoError(t, rows.Err())
+
+	_, err = conn.Exec("drop table if exists test_args")
 	require.NoError(t, err)
 }

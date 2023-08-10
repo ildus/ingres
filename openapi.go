@@ -159,13 +159,14 @@ type colBlock struct {
 	buffer *bytes.Buffer
 }
 
+type colGetBlocks []*colBlock
+
 type rows struct {
 	stmt               *stmt
 	transactionCreated bool
 
-	transHandle C.II_PTR
-	stmtHandle  C.II_PTR
-	queryType   QueryType
+	stmtHandle C.II_PTR
+	queryType  QueryType
 
 	finish func()
 	rowsHeader
@@ -181,7 +182,7 @@ type rows struct {
 	   we get first 4 columns, then read segments of 5 until it's completed,
 	   and then blocks 6-10
 	*/
-	colBlocks []*colBlock
+	colBlocks colGetBlocks
 
 	lastInsertId int64
 	rowsAffected int64
@@ -190,7 +191,7 @@ type rows struct {
 type QueryType uint
 
 const (
-	SELECT         QueryType = C.IIAPI_QT_QUERY
+	QUERY          QueryType = C.IIAPI_QT_QUERY
 	SELECT_ONE     QueryType = C.IIAPI_QT_SELECT_SINGLETON
 	EXEC           QueryType = C.IIAPI_QT_EXEC
 	OPEN           QueryType = C.IIAPI_QT_OPEN
@@ -203,10 +204,7 @@ type stmt struct {
 	queryType   QueryType
 	transaction *OpenAPITransaction
 
-	args  []driver.Value
-	vals  [][]byte
-	cols  *C.IIAPI_DATAVALUE // dv_value will point to vals[x] in vals
-	descs *C.IIAPI_DESCRIPTOR
+	args []driver.Value
 }
 
 var (
@@ -447,7 +445,6 @@ func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
 	case string:
 		resval = []byte(val.(string))
 		desc.ds_dataType = C.IIAPI_CHA_TYPE
-		desc.ds_length = C.uint16_t(len(resval))
 
 	case int8, int16, int32, int64:
 		var val64 uint64
@@ -466,16 +463,45 @@ func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
 		nativeEndian.PutUint64(resval, val64)
 
 		desc.ds_dataType = C.IIAPI_INT_TYPE
-		desc.ds_length = 8
+	case float32:
+		resval = make([]byte, 4)
+		nativeEndian.PutUint32(resval, math.Float32bits(val.(float32)))
+
+		desc.ds_dataType = C.IIAPI_FLT_TYPE
+	case float64:
+		resval = make([]byte, 8)
+		nativeEndian.PutUint64(resval, math.Float64bits(val.(float64)))
+
+		desc.ds_dataType = C.IIAPI_FLT_TYPE
 	default:
 		return nil
 	}
 
+	desc.ds_length = C.uint16_t(len(resval))
 	return resval
 }
 
 func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 	var err error
+	var cols *C.IIAPI_DATAVALUE
+	var descs *C.IIAPI_DESCRIPTOR
+
+	var vals [][]byte
+
+	/* cleanup everything at the end */
+	defer func() {
+		if cols != nil {
+			C.free(unsafe.Pointer(cols))
+		}
+
+		if descs != nil {
+			C.free(unsafe.Pointer(descs))
+		}
+
+		if vals != nil {
+			vals = nil
+		}
+	}()
 
 	if s.args == nil || len(s.args) == 0 {
 		return nil
@@ -485,24 +511,26 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 
 	var descrParm C.IIAPI_SETDESCRPARM
 
-	descrParm.sd_descriptorCount = C.short(len(args))
-	s.descs = C.allocate_descs(descrParm.sd_descriptorCount)
+	cnt := C.short(len(args))
+	descs = C.allocate_descs(cnt)
 
-	descrParm.sd_descriptor = s.descs
+	descrParm.sd_descriptor = descs
 	descrParm.sd_stmtHandle = stmtHandle
-	s.cols = C.allocate_cols(descrParm.sd_descriptorCount)
-	s.vals = make([][]byte, len(args))
+	descrParm.sd_descriptorCount = cnt
+
+	cols = C.allocate_cols(descrParm.sd_descriptorCount)
+	vals = make([][]byte, len(args))
 
 	for i, arg := range args {
-		val := fillDesc(C.get_desc(s.descs, C.ushort(i)), arg)
+		val := fillDesc(C.get_desc(descs, C.ushort(i)), arg)
 		if val == nil {
 			return errors.New("parameter conversion error")
 		}
 
-		s.vals[i] = val
-		C.set_dv_value(s.cols, C.int(i), unsafe.Pointer(&s.vals[i][0]))
-		C.set_dv_length(s.cols, C.int(i), C.ushort(len(val)))
-		C.set_dv_null(s.cols, C.int(i), 0)
+		vals[i] = val
+		C.set_dv_value(cols, C.int(i), unsafe.Pointer(&vals[i][0]))
+		C.set_dv_length(cols, C.int(i), C.ushort(len(val)))
+		C.set_dv_null(cols, C.int(i), 0)
 	}
 
 	C.IIapi_setDescriptor(&descrParm)
@@ -515,7 +543,7 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 	var putParm C.IIAPI_PUTPARMPARM
 	putParm.pp_stmtHandle = stmtHandle
 	putParm.pp_parmCount = descrParm.sd_descriptorCount
-	putParm.pp_parmData = s.cols
+	putParm.pp_parmData = cols
 
 	//TODO: segments support
 	putParm.pp_moreSegments = 0
@@ -533,10 +561,12 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	var err error
 	var stmtHandle C.II_PTR
+	var colBlocks colGetBlocks
 
 	defer func() {
 		if err != nil {
 			closeStmt(stmtHandle)
+			colBlocks.free()
 		}
 	}()
 
@@ -546,7 +576,7 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = s.conn.handle
-	queryParm.qy_queryType = C.uint(s.queryType)
+	queryParm.qy_queryType = C.uint(QUERY)
 	queryParm.qy_queryText = C.CString(s.query)
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
@@ -567,7 +597,6 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	res := &rows{
 		stmt:               s,
 		transactionCreated: transHandle == nil,
-		transHandle:        queryParm.qy_tranHandle,
 		stmtHandle:         stmtHandle,
 	}
 
@@ -581,6 +610,8 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		s.args = nil
 	}
 
 	// Get query result descriptors.
@@ -656,10 +687,10 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 			if res.colTyps[current].isLongType() {
 				b := newColBlock(start, current-1, false)
 				if b != nil {
-					res.colBlocks = append(res.colBlocks, b)
+					colBlocks = append(colBlocks, b)
 				}
 
-				res.colBlocks = append(res.colBlocks, newColBlock(current, current, true))
+				colBlocks = append(colBlocks, newColBlock(current, current, true))
 				start = current + 1
 			}
 			current += 1
@@ -667,10 +698,11 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 
 		b := newColBlock(start, current-1, false)
 		if b != nil {
-			res.colBlocks = append(res.colBlocks, b)
+			colBlocks = append(colBlocks, b)
 		}
 	}
 
+	res.colBlocks = colBlocks
 	return res, nil
 }
 
@@ -794,12 +826,12 @@ func (c *columnDesc) splitLenVal(val []byte) (uint16, []byte) {
 	switch c.ingDataType {
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE, C.IIAPI_VBYTE_TYPE:
 		cnt := nativeEndian.Uint16(val)
-        val = val[2:]
-        return cnt, val[:cnt]
+		val = val[2:]
+		return cnt, val[:cnt]
 	case C.IIAPI_NVCH_TYPE:
 		cnt := nativeEndian.Uint16(val)
-        val = val[2:]
-		return cnt, val[:cnt * 2]
+		val = val[2:]
+		return cnt, val[:cnt*2]
 	default:
 		return uint16(len(val)), val
 	}
@@ -977,18 +1009,23 @@ func closeStmt(stmtHandle C.II_PTR) error {
 }
 
 func (s *stmt) Close() error {
-	if s.cols != nil {
-		C.free(unsafe.Pointer(s.cols))
-		s.cols = nil
-	}
-
-	if s.descs != nil {
-		C.free(unsafe.Pointer(s.descs))
-		s.descs = nil
-	}
-
-	s.vals = nil
 	return nil
+}
+
+func (b colGetBlocks) free() {
+	// free C allocated arrays
+	for _, block := range b {
+		if block.cols != nil {
+			C.free(unsafe.Pointer(block.cols))
+			block.cols = nil
+		}
+
+		// reuse buffers
+		if block.buffer != nil {
+			bufferPool.Put(block.buffer)
+			block.buffer = nil
+		}
+	}
 }
 
 func (rs *rows) Close() error {
@@ -1003,18 +1040,7 @@ func (rs *rows) Close() error {
 	rs.stmtHandle = nil
 
 	// free C allocated arrays
-	for _, block := range rs.colBlocks {
-		if block.cols != nil {
-			C.free(unsafe.Pointer(block.cols))
-			block.cols = nil
-		}
-
-		// reuse buffers
-		if block.buffer != nil {
-			bufferPool.Put(block.buffer)
-			block.buffer = nil
-		}
-	}
+	rs.colBlocks.free()
 
 	return err
 }
