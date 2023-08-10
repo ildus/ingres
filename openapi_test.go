@@ -1,7 +1,7 @@
 package ingres
 
 import (
-    "database/sql"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"github.com/stretchr/testify/assert"
@@ -406,18 +406,18 @@ func TestDates(t *testing.T) {
 }
 
 func TestNull(t *testing.T) {
-    conn, err := sql.Open("ingres", "mydb")
+	conn, err := sql.Open("ingres", "mydb")
 	require.NoError(t, err)
-    defer conn.Close()
+	defer conn.Close()
 
-	_, err = conn.Exec("drop table if exists test_null", nil)
+	_, err = conn.Exec("drop table if exists test_null")
 	require.NoError(t, err)
 
 	_, err = conn.Exec(`create table test_null(
         d1 int null,
         d2 varchar(10) null,
         d3 int not null
-    )`, nil)
+    )`)
 	require.NoError(t, err)
 
 	_, err = conn.Exec(`insert into test_null values
@@ -425,45 +425,74 @@ func TestNull(t *testing.T) {
         (1, null, 2),
         (null, null, 3),
         (2, 'hkll', 4)
-    `, nil)
+    `)
 	require.NoError(t, err)
 
-	rows, err := conn.Query(`select * from test_null`, nil)
+	rows, err := conn.Query(`select * from test_null`)
 	require.NoError(t, err)
 	defer rows.Close()
 
-    var intval sql.NullInt32
-    var strval sql.NullString
-    var int2val int
+	var intval sql.NullInt32
+	var strval sql.NullString
+	var int2val int
 
-    rows.Next()
-    err = rows.Scan(&intval, &strval, &int2val)
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val)
 	require.NoError(t, err)
-    assert.False(t, intval.Valid)
-    assert.True(t, strval.Valid)
-    assert.Equal(t, 1, int2val)
+	assert.False(t, intval.Valid)
+	assert.True(t, strval.Valid)
+	assert.Equal(t, 1, int2val)
 
-    rows.Next()
-    err = rows.Scan(&intval, &strval, &int2val)
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val)
 	require.NoError(t, err)
-    assert.True(t, intval.Valid)
-    assert.False(t, strval.Valid)
-    assert.Equal(t, 2, int2val)
+	assert.True(t, intval.Valid)
+	assert.False(t, strval.Valid)
+	assert.Equal(t, 2, int2val)
 
-    rows.Next()
-    err = rows.Scan(&intval, &strval, &int2val)
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val)
 	require.NoError(t, err)
-    assert.False(t, intval.Valid)
-    assert.False(t, strval.Valid)
-    assert.Equal(t, 3, int2val)
+	assert.False(t, intval.Valid)
+	assert.False(t, strval.Valid)
+	assert.Equal(t, 3, int2val)
 
-    rows.Next()
-    err = rows.Scan(&intval, &strval, &int2val)
+	rows.Next()
+	err = rows.Scan(&intval, &strval, &int2val)
 	require.NoError(t, err)
-    assert.True(t, intval.Valid)
-    assert.True(t, strval.Valid)
-    assert.Equal(t, 4, int2val)
+	assert.True(t, intval.Valid)
+	assert.True(t, strval.Valid)
+	assert.Equal(t, 4, int2val)
 
-    require.False(t, rows.Next())
+	require.False(t, rows.Next())
 	require.NoError(t, rows.Err())
+}
+
+func TestPrepare(t *testing.T) {
+	conn, err := sql.Open("ingres", "mydb")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, err = conn.Exec("drop table if exists test_prepare")
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`create table test_prepare(
+        d1 int null,
+        d2 varchar(10) null,
+        d3 int not null
+    )`)
+	require.NoError(t, err)
+
+	stmt, err := conn.Prepare(`insert into test_prepare values (?, ?, ?`)
+	require.NoError(t, err)
+
+	res, err := stmt.Exec(1, "asdf", 2)
+	require.NoError(t, err)
+
+	cnt, err := res.RowsAffected()
+	require.NoError(t, err)
+	assert.Equal(t, cnt, 1)
+
+	_, err = conn.Exec("drop table if exists test_prepare")
+	require.NoError(t, err)
 }

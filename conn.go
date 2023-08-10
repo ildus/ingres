@@ -69,6 +69,7 @@ func (d Driver) Open(name string) (driver.Conn, error) {
 
 func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
 	return &stmt{
+		args:      nil,
 		conn:      c,
 		query:     query,
 		queryType: queryType,
@@ -99,10 +100,14 @@ func (c *OpenAPIConn) Close() error {
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.queryType = EXEC
+    if len(args) > 0 {
+	    s.args = args
+    }
+
 	if s.conn.currentTransaction == nil {
 		return nil, errors.New("transaction required")
 	}
-	rows, err := s.runQuery(s.conn.handle, s.conn.currentTransaction.handle)
+	rows, err := s.runQuery(s.conn.currentTransaction.handle)
 	if err != nil {
 		return nil, err
 	}
@@ -122,12 +127,13 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.queryType = SELECT
+	s.args = args
 
 	if s.conn.currentTransaction == nil {
 		return nil, errors.New("transaction required")
 	}
 
-	return s.runQuery(s.conn.handle, s.conn.currentTransaction.handle)
+	return s.runQuery(s.conn.currentTransaction.handle)
 }
 
 func (s *stmt) NumInput() int {
@@ -135,19 +141,19 @@ func (s *stmt) NumInput() int {
 }
 
 func (t *OpenAPITransaction) Commit() error {
-    err := commitTransaction(t.handle)
-    if err == nil {
-        t.conn.currentTransaction = nil
-        t.conn.AutoCommit()
-    }
-    return err
+	err := commitTransaction(t.handle)
+	if err == nil {
+		t.conn.currentTransaction = nil
+		t.conn.AutoCommit()
+	}
+	return err
 }
 
 func (t *OpenAPITransaction) Rollback() error {
-    err := rollbackTransaction(t.handle)
-    if err == nil {
-        t.conn.currentTransaction = nil
-        t.conn.AutoCommit()
-    }
-    return err
+	err := rollbackTransaction(t.handle)
+	if err == nil {
+		t.conn.currentTransaction = nil
+		t.conn.AutoCommit()
+	}
+	return err
 }

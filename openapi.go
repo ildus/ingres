@@ -16,6 +16,11 @@ static inline IIAPI_DESCRIPTOR * get_descr(IIAPI_GETDESCRPARM *descrParm, size_t
     return &descrParm->gd_descriptor[i];
 }
 
+static inline IIAPI_DESCRIPTOR * allocate_descs(short len)
+{
+    return malloc(sizeof(IIAPI_DESCRIPTOR) * len);
+}
+
 static inline IIAPI_DATAVALUE * allocate_cols(short len)
 {
     return malloc(sizeof(IIAPI_DATAVALUE) * len);
@@ -29,6 +34,16 @@ static inline void set_dv_value(IIAPI_DATAVALUE *dest, int i, void *val)
 static inline void set_dv_length(IIAPI_DATAVALUE *dest, int i, uint16_t len)
 {
     dest[i].dv_length = len;
+}
+
+static inline void set_dv_null(IIAPI_DATAVALUE *dest, int i, II_BOOL val)
+{
+    dest[i].dv_null = val;
+}
+
+static inline IIAPI_DESCRIPTOR * get_desc(IIAPI_DESCRIPTOR *dest, uint16_t i)
+{
+    return &dest[i];
 }
 
 static inline IIAPI_DATAVALUE * get_dv(IIAPI_DATAVALUE *dest, uint16_t i)
@@ -149,6 +164,7 @@ type rows struct {
 	transactionCreated bool
 
 	transHandle C.II_PTR
+	stmtHandle  C.II_PTR
 	queryType   QueryType
 
 	finish func()
@@ -186,7 +202,11 @@ type stmt struct {
 	query       string
 	queryType   QueryType
 	transaction *OpenAPITransaction
-	stmtHandle  C.II_PTR
+
+	args  []driver.Value
+	vals  [][]byte
+	cols  *C.IIAPI_DATAVALUE // dv_value will point to vals[x] in vals
+	descs *C.IIAPI_DESCRIPTOR
 }
 
 var (
@@ -370,7 +390,7 @@ func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 	}
 
 	s := makeStmt(c, "begin transaction", EXEC)
-	rows, err := s.runQuery(s.conn.handle, nil)
+	rows, err := s.runQuery(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -414,43 +434,160 @@ func wait(genParm *C.IIAPI_GENPARM) {
 	}
 }
 
-func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error) {
+func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
+	var resval []byte
+
+	desc.ds_columnType = C.IIAPI_COL_QPARM
+	desc.ds_columnName = nil
+	desc.ds_nullable = 0
+	desc.ds_precision = 0
+	desc.ds_scale = 0
+
+	switch val.(type) {
+	case string:
+		resval = []byte(val.(string))
+		desc.ds_dataType = C.IIAPI_CHA_TYPE
+		desc.ds_length = C.uint16_t(len(resval))
+
+	case int8, int16, int32, int64:
+		var val64 uint64
+
+		switch val.(type) {
+		case int8:
+			val64 = uint64(val.(int8))
+		case int16:
+			val64 = uint64(val.(int16))
+		case int32:
+			val64 = uint64(val.(int32))
+		case int64:
+			val64 = uint64(val.(int64))
+		}
+		resval = make([]byte, 8)
+		nativeEndian.PutUint64(resval, val64)
+
+		desc.ds_dataType = C.IIAPI_INT_TYPE
+		desc.ds_length = 8
+	default:
+		return nil
+	}
+
+	return resval
+}
+
+func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
+	var err error
+
+	if s.args == nil || len(s.args) == 0 {
+		return nil
+	}
+
+	args := s.args
+
+	var descrParm C.IIAPI_SETDESCRPARM
+
+	descrParm.sd_descriptorCount = C.short(len(args))
+	s.descs = C.allocate_descs(descrParm.sd_descriptorCount)
+
+	descrParm.sd_descriptor = s.descs
+	descrParm.sd_stmtHandle = stmtHandle
+	s.cols = C.allocate_cols(descrParm.sd_descriptorCount)
+	s.vals = make([][]byte, len(args))
+
+	for i, arg := range args {
+		val := fillDesc(C.get_desc(s.descs, C.ushort(i)), arg)
+		if val == nil {
+			return errors.New("parameter conversion error")
+		}
+
+		s.vals[i] = val
+		C.set_dv_value(s.cols, C.int(i), unsafe.Pointer(&s.vals[i][0]))
+		C.set_dv_length(s.cols, C.int(i), C.ushort(len(val)))
+		C.set_dv_null(s.cols, C.int(i), 0)
+	}
+
+	C.IIapi_setDescriptor(&descrParm)
+	wait(&descrParm.sd_genParm)
+	err = checkError("IIapi_setDescriptor()", &descrParm.sd_genParm)
+	if err != nil {
+		return err
+	}
+
+	var putParm C.IIAPI_PUTPARMPARM
+	putParm.pp_stmtHandle = stmtHandle
+	putParm.pp_parmCount = descrParm.sd_descriptorCount
+	putParm.pp_parmData = s.cols
+
+	//TODO: segments support
+	putParm.pp_moreSegments = 0
+
+	C.IIapi_putParms(&putParm)
+	wait(&putParm.pp_genParm)
+	err = checkError("IIapi_putParms()", &putParm.pp_genParm)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
+	var err error
+	var stmtHandle C.II_PTR
+
+	defer func() {
+		if err != nil {
+			closeStmt(stmtHandle)
+		}
+	}()
+
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
-	queryParm.qy_connHandle = connHandle
+	queryParm.qy_connHandle = s.conn.handle
 	queryParm.qy_queryType = C.uint(s.queryType)
 	queryParm.qy_queryText = C.CString(s.query)
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
 	queryParm.qy_stmtHandle = nil
 
+	if len(s.args) > 0 {
+		queryParm.qy_parameters = 1
+	}
+
 	C.IIapi_query(&queryParm)
 	wait(&queryParm.qy_genParm)
-	err := checkError("IIapi_query()", &queryParm.qy_genParm)
+	err = checkError("IIapi_query()", &queryParm.qy_genParm)
 	if err != nil {
 		return nil, err
 	}
 
+	stmtHandle = queryParm.qy_stmtHandle
 	res := &rows{
 		stmt:               s,
 		transactionCreated: transHandle == nil,
 		transHandle:        queryParm.qy_tranHandle,
+		stmtHandle:         stmtHandle,
 	}
 
-    s.stmtHandle = queryParm.qy_stmtHandle
 	s.transaction = &OpenAPITransaction{
 		handle: queryParm.qy_tranHandle,
 		conn:   s.conn,
+	}
+
+	if len(s.args) > 0 {
+		err = s.sendArgs(res.stmtHandle)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Get query result descriptors.
 	if s.queryType != EXEC {
 		getDescrParm.gd_genParm.gp_callback = nil
 		getDescrParm.gd_genParm.gp_closure = nil
-		getDescrParm.gd_stmtHandle = s.stmtHandle
+		getDescrParm.gd_stmtHandle = res.stmtHandle
 		getDescrParm.gd_descriptorCount = 0
 		getDescrParm.gd_descriptor = nil
 
@@ -459,7 +596,6 @@ func (s *stmt) runQuery(connHandle C.II_PTR, transHandle C.II_PTR) (*rows, error
 
 		err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
 		if err != nil {
-			res.Close()
 			return nil, err
 		}
 
@@ -654,6 +790,21 @@ func (c *columnDesc) isLongType() bool {
 	}
 }
 
+func (c *columnDesc) splitLenVal(val []byte) (uint16, []byte) {
+	switch c.ingDataType {
+	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE, C.IIAPI_VBYTE_TYPE:
+		cnt := nativeEndian.Uint16(val)
+        val = val[2:]
+        return cnt, val[:cnt]
+	case C.IIAPI_NVCH_TYPE:
+		cnt := nativeEndian.Uint16(val)
+        val = val[2:]
+		return cnt, val[:cnt * 2]
+	default:
+		return uint16(len(val)), val
+	}
+}
+
 func (c *columnDesc) getType() reflect.Type {
 	switch c.ingDataType {
 	case
@@ -806,23 +957,37 @@ func (c *columnDesc) Length() (int64, bool) {
 	return val, true
 }
 
+func closeStmt(stmtHandle C.II_PTR) error {
+	if stmtHandle != nil {
+		var closeParm C.IIAPI_CLOSEPARM
+
+		closeParm.cl_genParm.gp_callback = nil
+		closeParm.cl_genParm.gp_closure = nil
+		closeParm.cl_stmtHandle = stmtHandle
+
+		C.IIapi_close(&closeParm)
+		wait(&closeParm.cl_genParm)
+		err := checkError("IIapi_close()", &closeParm.cl_genParm)
+
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *stmt) Close() error {
-    if s.stmtHandle != nil {
-        var closeParm C.IIAPI_CLOSEPARM
+	if s.cols != nil {
+		C.free(unsafe.Pointer(s.cols))
+		s.cols = nil
+	}
 
-        closeParm.cl_genParm.gp_callback = nil
-        closeParm.cl_genParm.gp_closure = nil
-        closeParm.cl_stmtHandle = s.stmtHandle
+	if s.descs != nil {
+		C.free(unsafe.Pointer(s.descs))
+		s.descs = nil
+	}
 
-        C.IIapi_close(&closeParm)
-        wait(&closeParm.cl_genParm)
-        err := checkError("IIapi_close()", &closeParm.cl_genParm)
-
-        s.stmtHandle = nil
-
-        return err
-    }
-
+	s.vals = nil
 	return nil
 }
 
@@ -831,7 +996,11 @@ func (rs *rows) Close() error {
 		defer finish()
 	}
 
-	err := rs.stmt.Close()
+	err := closeStmt(rs.stmtHandle)
+	if err != nil {
+		return err
+	}
+	rs.stmtHandle = nil
 
 	// free C allocated arrays
 	for _, block := range rs.colBlocks {
@@ -850,9 +1019,15 @@ func (rs *rows) Close() error {
 	return err
 }
 
+// Gets a new row
 func (rs *rows) fetchData() error {
 	var err error
 	var getColParm C.IIAPI_GETCOLPARM
+
+	if rs.done {
+		// do nothing
+		return nil
+	}
 
 	for i := 0; i < len(rs.nulls); i++ {
 		rs.nulls[i] = false
@@ -868,7 +1043,7 @@ func (rs *rows) fetchData() error {
 		getColParm.gc_rowCount = 1
 		getColParm.gc_columnCount = C.short(block.count)
 		getColParm.gc_columnData = block.cols
-		getColParm.gc_stmtHandle = rs.stmt.stmtHandle
+		getColParm.gc_stmtHandle = rs.stmtHandle
 
 		for {
 			getColParm.gc_moreSegments = 0
@@ -921,9 +1096,13 @@ func (rs *rows) fetchInfo() error {
 	var getQInfoParm C.IIAPI_GETQINFOPARM
 
 	/* Get fetch result info */
+	if rs.stmtHandle == nil {
+		return errors.New("statement is already closed")
+	}
+
 	getQInfoParm.gq_genParm.gp_callback = nil
 	getQInfoParm.gq_genParm.gp_closure = nil
-	getQInfoParm.gq_stmtHandle = rs.stmt.stmtHandle
+	getQInfoParm.gq_stmtHandle = rs.stmtHandle
 
 	info := &getQInfoParm
 	C.IIapi_getQueryInfo(info)
@@ -949,6 +1128,9 @@ func shrinkStrWithBlanks(res string) string {
 
 func decode(col *columnDesc, val []byte) (driver.Value, error) {
 	var res driver.Value
+
+	_, val = col.splitLenVal(val)
+
 	switch col.ingDataType {
 	case C.IIAPI_INT_TYPE:
 		switch col.length {
@@ -981,12 +1163,10 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		val = col.block.buffer.Bytes()
 		res = shrinkStr(string(val))
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
-		res = shrinkStr(string(val[2:]))
+		res = shrinkStr(string(val))
 	case C.IIAPI_BOOL_TYPE:
 		res = (val[0] == 1)
-	case C.IIAPI_VBYTE_TYPE:
-		res = val[2:]
-	case C.IIAPI_BYTE_TYPE:
+	case C.IIAPI_VBYTE_TYPE, C.IIAPI_BYTE_TYPE:
 		res = val
 	case C.IIAPI_LBYTE_TYPE:
 		if col.block == nil {
@@ -994,10 +1174,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		}
 
 		res = col.block.buffer.Bytes()
-	case C.IIAPI_NVCH_TYPE:
-		val = val[2:]
-		fallthrough
-	case C.IIAPI_NCHA_TYPE:
+	case C.IIAPI_NVCH_TYPE, C.IIAPI_NCHA_TYPE:
 		out := make([]uint16, len(val)/2)
 		for i := range out {
 			out[i] = nativeEndian.Uint16(val[i*2:])
@@ -1044,7 +1221,7 @@ func convertToStr(cd *columnDesc, val []byte) (string, error) {
 		C.II_PTR(&destBuf[0]), C.ushort(len(destBuf)))
 
 	if status != C.IIAPI_ST_SUCCESS {
-		return "", errors.New("convertation error")
+		return "", errors.New("conversion error")
 	}
 
 	res := string(destBuf)
