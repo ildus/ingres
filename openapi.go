@@ -1179,7 +1179,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			res = math.Float64frombits(bits)
 		}
 	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
-		res = shrinkStr(string(val))
+		res = shrinkStrWithBlanks(string(val))
 	case C.IIAPI_LVCH_TYPE, C.IIAPI_LTXT_TYPE:
 		if col.block == nil {
 			return nil, errors.New("internal: long types should have a link to column block")
