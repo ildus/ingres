@@ -540,3 +540,21 @@ func TestArgs(t *testing.T) {
 	_, err = conn.Exec("drop table if exists test_args")
 	require.NoError(t, err)
 }
+
+func TestFew(t *testing.T) {
+	conn, err := sql.Open("ingres", "mydb")
+	require.NoError(t, err)
+	defer conn.Close()
+
+    rows, err := conn.Query("select relid from iirelation")
+	require.NoError(t, err)
+
+    var s string
+	rows.Next()
+    rows.Scan(&s)
+    require.True(t, len(s) > 0)
+
+    err = rows.Close()
+	require.NoError(t, err)
+	require.NoError(t, rows.Err())
+}

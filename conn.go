@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"strings"
 )
 
 // Compile time validation that our types implement the expected interfaces
@@ -53,6 +55,29 @@ func init() {
 
 func (d Driver) Open(name string) (driver.Conn, error) {
 	var params ConnParams
+
+	if strings.Contains(name, "?") {
+		parts := strings.Split(name, "?")
+		if len(parts) != 2 {
+			return nil, errors.New("DSN is invalid")
+		}
+
+		values, err := url.ParseQuery(parts[1])
+
+		if err != nil {
+			return nil, errors.New("parameters parse error")
+		}
+
+		if values.Has("username") && !values.Has("password") {
+			return nil, errors.New("password has not been specified")
+		}
+
+		params.UserName = values.Get("username")
+		params.Password = values.Get("password")
+
+		name = parts[0]
+	}
+
 	params.DbName = name
 	conn, err := env.Connect(params)
 	if err != nil {
@@ -100,9 +125,9 @@ func (c *OpenAPIConn) Close() error {
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.queryType = EXEC
-    if len(args) > 0 {
-	    s.args = args
-    }
+	if len(args) > 0 {
+		s.args = args
+	}
 
 	if s.conn.currentTransaction == nil {
 		return nil, errors.New("transaction required")
