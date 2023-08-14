@@ -7,10 +7,10 @@ endif
 makeFileDir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 .PHONY: all
-all: ingo
+all: lib
 
 iiapi.pc: iiapi.pc.template
 	sed "s~II_SYSTEM~${II_SYSTEM}~g" iiapi.pc.template > $@
 
-ingo: main.go iiapi.pc
+lib: main.go iiapi.pc
 	PKG_CONFIG_PATH=${makeFileDir} go build

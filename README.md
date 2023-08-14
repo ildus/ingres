@@ -1,12 +1,12 @@
-Ingres (Vector) Go Library
-=============================
+Ingres (Vector) Go Library (OpenAPI)
+=====================================
 
 Compilation
 ------------
 
-    # II_SYSTEM should be set
+    # II_SYSTEM environment variable should be set
     make iiapi.pc
-    go build
+    PKG_CONFIG_PATH=. go build
 
 Usage
 ------
@@ -18,5 +18,6 @@ DSN examples
 * dbname
 * vnode::dbname
 * vnode::dbname/db_class
+* vnode::dbname?username=actian&password=pass
 
 Vnodes could be set up with `netutil` utility.
