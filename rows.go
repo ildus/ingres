@@ -5,13 +5,13 @@ package ingres
 */
 import "C"
 import (
+	"fmt"
 	"reflect"
-    "fmt"
 )
 
 //export HandleTraceMessage
 func HandleTraceMessage(parm *C.IIAPI_TRACEPARM) {
-    fmt.Print(C.GoString(parm.tr_message))
+	fmt.Print(C.GoString(parm.tr_message))
 }
 
 // ColumnTypeScanType returns the value type that can be used to scan types into.

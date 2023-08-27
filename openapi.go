@@ -259,12 +259,12 @@ func InitOpenAPI() (*OpenAPIEnv, error) {
 		return nil, errors.New("could not initialize Ingres OpenAPI")
 	}
 
-    handle := C.InitParm.in_envHandle
+	handle := C.InitParm.in_envHandle
 	return &OpenAPIEnv{handle: handle}, nil
 }
 
 func (env *OpenAPIEnv) EnableTrace() {
-    C.enable_trace(env.handle)
+	C.enable_trace(env.handle)
 }
 
 func ReleaseOpenAPI(env *OpenAPIEnv) {
