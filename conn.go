@@ -49,6 +49,8 @@ func init() {
 		log.Fatalf("could not initialize OpenAPI: %v", err)
 	}
 
+	env.EnableTrace()
+
 	d := &Driver{}
 	sql.Register("ingres", d)
 }
@@ -96,7 +98,7 @@ func makeStmt(c *OpenAPIConn, query string, queryType QueryType) *stmt {
 	return &stmt{
 		args:      nil,
 		conn:      c,
-		query:     query,
+		query:     strings.TrimRight(query, "; "),
 		queryType: queryType,
 	}
 }
@@ -124,6 +126,9 @@ func (c *OpenAPIConn) Close() error {
 }
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
+	var rows *rows
+	var err error
+
 	s.queryType = EXEC
 	if len(args) > 0 {
 		s.args = args
@@ -132,17 +137,13 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	if s.conn.currentTransaction == nil {
 		return nil, errors.New("transaction required")
 	}
-	rows, err := s.runQuery(s.conn.currentTransaction.handle)
+	rows, err = s.runQuery(s.conn.currentTransaction.handle)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	err = rows.fetchInfo()
-	if err != nil {
-		return nil, err
-	}
-
-	err = rows.Close()
 	if err != nil {
 		return nil, err
 	}

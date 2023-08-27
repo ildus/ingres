@@ -1,8 +1,18 @@
 package ingres
 
+/*
+#include <iiapi.h>
+*/
+import "C"
 import (
 	"reflect"
+    "fmt"
 )
+
+//export HandleTraceMessage
+func HandleTraceMessage(parm *C.IIAPI_TRACEPARM) {
+    fmt.Print(C.GoString(parm.tr_message))
+}
 
 // ColumnTypeScanType returns the value type that can be used to scan types into.
 func (rs *rows) ColumnTypeScanType(index int) reflect.Type {

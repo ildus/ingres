@@ -3,6 +3,7 @@ package ingres
 /*
 #cgo pkg-config: iiapi
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -51,7 +52,7 @@ static inline IIAPI_DATAVALUE * get_dv(IIAPI_DATAVALUE *dest, uint16_t i)
     return &dest[i];
 }
 
-static IIAPI_STATUS convertToStr(IIAPI_DT_ID dt, II_PTR val, uint16_t len,
+static IIAPI_STATUS convert_to_string(IIAPI_DT_ID dt, II_PTR val, uint16_t len,
     II_PTR buf, ushort buflen)
 {
     IIAPI_CONVERTPARM	cv;
@@ -84,6 +85,18 @@ static IIAPI_STATUS convertToStr(IIAPI_DT_ID dt, II_PTR val, uint16_t len,
     IIapi_convertData(&cv);
 
     return cv.cv_status;
+}
+
+extern void HandleTraceMessage(IIAPI_TRACEPARM *parm);
+
+static IIAPI_STATUS enable_trace(II_PTR env_handle)
+{
+    IIAPI_SETENVPRMPARM parm;
+    parm.se_envHandle = env_handle;
+    parm.se_paramID = IIAPI_EP_TRACE_FUNC;
+    parm.se_paramValue = HandleTraceMessage;
+
+    IIapi_setEnvParam(&parm);
 }
 
 //examples - common/aif/demo/api**.c
@@ -246,7 +259,12 @@ func InitOpenAPI() (*OpenAPIEnv, error) {
 		return nil, errors.New("could not initialize Ingres OpenAPI")
 	}
 
-	return &OpenAPIEnv{handle: C.InitParm.in_envHandle}, nil
+    handle := C.InitParm.in_envHandle
+	return &OpenAPIEnv{handle: handle}, nil
+}
+
+func (env *OpenAPIEnv) EnableTrace() {
+    C.enable_trace(env.handle)
 }
 
 func ReleaseOpenAPI(env *OpenAPIEnv) {
@@ -1216,6 +1234,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		res = string(utf16.Decode(out))
 		res = shrinkStr(res.(string))
 	case
+		C.IIAPI_DEC_TYPE,   /* Decimal */
 		C.IIAPI_DTE_TYPE,   /* Ingres Date */
 		C.IIAPI_DATE_TYPE,  /* ANSI Date */
 		C.IIAPI_TIME_TYPE,  /* Ingres Time */
@@ -1243,7 +1262,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 func convertToStr(cd *columnDesc, val []byte) (string, error) {
 	var destBuf = smallBytesPool.Get().([]byte)
 
-	status := C.convertToStr(cd.ingDataType, C.II_PTR(&val[0]), C.ushort(len(val)),
+	status := C.convert_to_string(cd.ingDataType, C.II_PTR(&val[0]), C.ushort(len(val)),
 		C.II_PTR(&destBuf[0]), C.ushort(len(destBuf)))
 
 	if status != C.IIAPI_ST_SUCCESS {
