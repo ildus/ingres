@@ -566,3 +566,45 @@ func TestFew(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, rows.Err())
 }
+
+func TestInsert5000Rows(t *testing.T) {
+	conn, err := sql.Open("ingres", testDBName)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, err = conn.Exec("drop table if exists test_5000_rows")
+	require.NoError(t, err)
+
+	_, err = conn.Exec("create table test_5000_rows (id int, name varchar(100))")
+	require.NoError(t, err)
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+
+	stmt, err := tx.Prepare("insert into test_5000_rows values ( ~V , ~V )")
+	require.NoError(t, err)
+
+	for i := 0; i < 5000; i++ {
+		_, err = stmt.Exec(i, fmt.Sprintf("name_%d", i))
+		require.NoError(t, err)
+	}
+
+	err = stmt.Close()
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.NoError(t, err)
+
+	rows, err := conn.Query("select count(*) from test_5000_rows")
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var count int
+	rows.Next()
+	err = rows.Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 5000, count)
+
+	_, err = conn.Exec("drop table test_5000_rows")
+	require.NoError(t, err)
+}
