@@ -53,7 +53,7 @@ static inline IIAPI_DATAVALUE * get_dv(IIAPI_DATAVALUE *dest, uint16_t i)
 }
 
 static IIAPI_STATUS convert_to_string(IIAPI_DT_ID dt, II_PTR val, uint16_t len,
-    II_PTR buf, ushort buflen)
+    II_PTR buf, uint16_t buflen)
 {
     IIAPI_CONVERTPARM	cv;
 
@@ -97,6 +97,8 @@ static IIAPI_STATUS enable_trace(II_PTR env_handle)
     parm.se_paramValue = HandleTraceMessage;
 
     IIapi_setEnvParam(&parm);
+
+    return 0;
 }
 
 //examples - common/aif/demo/api**.c
@@ -809,7 +811,7 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 
 			msg = fmt.Sprintf("%s: %s", desc, msg)
 
-			state := fmt.Sprintf("%s", getErrParm.ge_SQLSTATE)
+			state := C.GoString((*C.char)(unsafe.Pointer(&getErrParm.ge_SQLSTATE[0])))
 			errorCode := int(getErrParm.ge_errorCode)
 			if err != nil {
 				wrapped := fmt.Errorf("%w\n%s", err, msg)
@@ -1138,6 +1140,7 @@ func (rs *rows) fetchData() error {
 
 func (rs *rows) fetchInfo() error {
 	var getQInfoParm C.IIAPI_GETQINFOPARM
+	var waitParm C.IIAPI_WAITPARM
 
 	/* Get fetch result info */
 	if rs.stmtHandle == nil {
@@ -1150,7 +1153,12 @@ func (rs *rows) fetchInfo() error {
 
 	info := &getQInfoParm
 	C.IIapi_getQueryInfo(info)
-	wait(&info.gq_genParm)
+
+	waitParm.wt_timeout = -1
+	for info.gq_genParm.gp_completed == 0 {
+		C.IIapi_wait(&waitParm)
+	}
+
 	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
 		rs.Close()
