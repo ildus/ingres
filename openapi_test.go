@@ -4,11 +4,19 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"os"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
 	"testing"
 )
+
+var testDBName = func() string {
+	if db := os.Getenv("INGRES_TEST_DB"); db != "" {
+		return db
+	}
+	return "mydb"
+}()
 
 func TestInitOpenAPI(t *testing.T) {
 	verbose = false
@@ -22,7 +30,7 @@ func TestConnect(t *testing.T) {
 	require.NoError(t, err)
 	defer ReleaseOpenAPI(env)
 
-	conn, err := env.Connect(ConnParams{DbName: "mydb"})
+	conn, err := env.Connect(ConnParams{DbName: testDBName})
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -78,7 +86,7 @@ func testconn(t *testing.T) (*OpenAPIConn, func()) {
 	env, err := InitOpenAPI()
 	require.NoError(t, err)
 
-	conn, err := env.Connect(ConnParams{DbName: "mydb"})
+	conn, err := env.Connect(ConnParams{DbName: testDBName})
 	require.NoError(t, err)
 	if err != nil {
 		ReleaseOpenAPI(env)
@@ -406,7 +414,7 @@ func TestDates(t *testing.T) {
 }
 
 func TestNull(t *testing.T) {
-	conn, err := sql.Open("ingres", "mydb")
+	conn, err := sql.Open("ingres", testDBName)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -414,18 +422,18 @@ func TestNull(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = conn.Exec(`create table test_null(
-        d1 int null,
-        d2 varchar(10) null,
-        d3 int not null
-    )`)
+         d1 int null,
+         d2 varchar(10) null,
+         d3 int not null
+     )`)
 	require.NoError(t, err)
 
 	_, err = conn.Exec(`insert into test_null values
-        (null, 'asdf', 1),
-        (1, null, 2),
-        (null, null, 3),
-        (2, 'hkll', 4)
-    `)
+         (null, 'asdf', 1),
+         (1, null, 2),
+         (null, null, 3),
+         (2, 'hkll', 4)
+     `)
 	require.NoError(t, err)
 
 	rows, err := conn.Query(`select * from test_null`)
@@ -469,7 +477,7 @@ func TestNull(t *testing.T) {
 }
 
 func TestArgs(t *testing.T) {
-	conn, err := sql.Open("ingres", "mydb")
+	conn, err := sql.Open("ingres", testDBName)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -477,12 +485,12 @@ func TestArgs(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = conn.Exec(`create table test_args(
-        d1 int null,
-        d2 varchar(10) null,
-        d3 int not null,
-        d4 float4,
-        d5 float8
-    )`)
+         d1 int null,
+         d2 varchar(10) null,
+         d3 int not null,
+         d4 float4,
+         d5 float8
+     )`)
 	require.NoError(t, err)
 
 	res, err := conn.Exec(`insert into test_args values ( ~V , ~V , ~V , ~V , ~V )`,
@@ -542,7 +550,7 @@ func TestArgs(t *testing.T) {
 }
 
 func TestFew(t *testing.T) {
-	conn, err := sql.Open("ingres", "mydb")
+	conn, err := sql.Open("ingres", testDBName)
 	require.NoError(t, err)
 	defer conn.Close()
 
