@@ -49,7 +49,9 @@ func init() {
 		log.Fatalf("could not initialize OpenAPI: %v", err)
 	}
 
-	env.EnableTrace()
+	if verbose {
+		env.EnableTrace()
+	}
 
 	d := &Driver{}
 	sql.Register("ingres", d)
@@ -125,6 +127,15 @@ func (c *OpenAPIConn) Close() error {
 	return disconnect(c)
 }
 
+func isBadConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+	return strings.Contains(msg, "current state") || strings.Contains(msg, "active transactions")
+}
+
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	var rows *rows
 	var err error
@@ -139,12 +150,18 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	}
 	rows, err = s.runQuery(s.conn.currentTransaction.handle)
 	if err != nil {
+		if isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
 		return nil, err
 	}
 	defer rows.Close()
 
 	err = rows.fetchInfo()
 	if err != nil {
+		if isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
 		return nil, err
 	}
 
@@ -159,7 +176,12 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 		return nil, errors.New("transaction required")
 	}
 
-	return s.runQuery(s.conn.currentTransaction.handle)
+	rows, err := s.runQuery(s.conn.currentTransaction.handle)
+	if err != nil && isBadConnError(err) {
+		return nil, driver.ErrBadConn
+	}
+
+	return rows, err
 }
 
 func (s *stmt) NumInput() int {

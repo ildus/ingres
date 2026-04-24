@@ -596,7 +596,7 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = s.conn.handle
-	queryParm.qy_queryType = C.uint(QUERY)
+	queryParm.qy_queryType = C.uint(s.queryType)
 	queryParm.qy_queryText = C.CString(s.query)
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
