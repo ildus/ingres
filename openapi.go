@@ -407,9 +407,35 @@ func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		}
 	}
 
-	tx := &OpenAPITransaction{conn: c, handle: nil, autocommit: false}
-	c.currentTransaction = tx
-	return tx, nil
+	s := makeStmt(c, "begin transaction", EXEC)
+	rows, err := s.runQuery(nil)
+	if err != nil {
+		if isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
+		return nil, err
+	}
+
+	err = rows.fetchInfo()
+	if err != nil {
+		_ = rows.Close()
+		if isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
+		return nil, err
+	}
+
+	err = rows.Close()
+	if err != nil {
+		if isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
+		return nil, err
+	}
+
+	c.currentTransaction = s.transaction
+	c.currentTransaction.autocommit = false
+	return c.currentTransaction, nil
 }
 
 func (c *OpenAPIConn) DisableAutoCommit() error {
@@ -1006,19 +1032,24 @@ func (c *columnDesc) Length() (int64, bool) {
 
 func closeStmt(stmtHandle C.II_PTR) error {
 	if stmtHandle != nil {
-		var closeParm C.IIAPI_CLOSEPARM
+		runClose := func() error {
+			var closeParm C.IIAPI_CLOSEPARM
 
-		closeParm.cl_genParm.gp_callback = nil
-		closeParm.cl_genParm.gp_closure = nil
-		closeParm.cl_stmtHandle = stmtHandle
+			closeParm.cl_genParm.gp_callback = nil
+			closeParm.cl_genParm.gp_closure = nil
+			closeParm.cl_stmtHandle = stmtHandle
 
-		C.IIapi_close(&closeParm)
-		wait(&closeParm.cl_genParm)
-		err := checkError("IIapi_close()", &closeParm.cl_genParm)
+			C.IIapi_close(&closeParm)
+			wait(&closeParm.cl_genParm)
+			return checkError("IIapi_close()", &closeParm.cl_genParm)
+		}
+
+		err := runClose()
 		if err != nil {
 			msg := err.Error()
 			if strings.Contains(msg, "Operation interrupted.") || strings.Contains(msg, "Query cancelled.") {
-				return nil
+				_ = cancelStmt(stmtHandle)
+				err = runClose()
 			}
 		}
 
