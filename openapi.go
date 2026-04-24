@@ -638,12 +638,17 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 		queryType:          s.queryType,
 	}
 
+	nextTranHandle := queryParm.qy_tranHandle
+	if nextTranHandle == nil {
+		nextTranHandle = transHandle
+	}
+
 	s.transaction = &OpenAPITransaction{
-		handle: queryParm.qy_tranHandle,
+		handle: nextTranHandle,
 		conn:   s.conn,
 	}
-	if s.conn.currentTransaction != nil {
-		s.conn.currentTransaction.handle = queryParm.qy_tranHandle
+	if s.conn.currentTransaction != nil && nextTranHandle != nil {
+		s.conn.currentTransaction.handle = nextTranHandle
 	}
 
 	if len(s.args) > 0 {
