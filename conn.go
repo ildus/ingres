@@ -146,11 +146,18 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	}
 
 	if s.conn.currentTransaction == nil {
-		return nil, errors.New("transaction required")
+		err = s.conn.AutoCommit()
+		if err != nil {
+			if isBadConnError(err) {
+				return nil, driver.ErrBadConn
+			}
+			return nil, err
+		}
 	}
+	autocommitMode := s.conn.currentTransaction != nil && s.conn.currentTransaction.autocommit
 	rows, err = s.runQuery(s.conn.currentTransaction.handle)
 	if err != nil {
-		if isBadConnError(err) {
+		if autocommitMode && isBadConnError(err) {
 			return nil, driver.ErrBadConn
 		}
 		return nil, err
@@ -159,7 +166,7 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 
 	err = rows.fetchInfo()
 	if err != nil {
-		if isBadConnError(err) {
+		if autocommitMode && isBadConnError(err) {
 			return nil, driver.ErrBadConn
 		}
 		return nil, err
@@ -173,11 +180,18 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.args = args
 
 	if s.conn.currentTransaction == nil {
-		return nil, errors.New("transaction required")
+		err := s.conn.AutoCommit()
+		if err != nil {
+			if isBadConnError(err) {
+				return nil, driver.ErrBadConn
+			}
+			return nil, err
+		}
 	}
+	autocommitMode := s.conn.currentTransaction != nil && s.conn.currentTransaction.autocommit
 
 	rows, err := s.runQuery(s.conn.currentTransaction.handle)
-	if err != nil && isBadConnError(err) {
+	if err != nil && autocommitMode && isBadConnError(err) {
 		return nil, driver.ErrBadConn
 	}
 
@@ -189,19 +203,27 @@ func (s *stmt) NumInput() int {
 }
 
 func (t *OpenAPITransaction) Commit() error {
+	if t.handle == nil {
+		t.conn.currentTransaction = nil
+		return nil
+	}
+
 	err := commitTransaction(t.handle)
 	if err == nil {
 		t.conn.currentTransaction = nil
-		t.conn.AutoCommit()
 	}
 	return err
 }
 
 func (t *OpenAPITransaction) Rollback() error {
+	if t.handle == nil {
+		t.conn.currentTransaction = nil
+		return nil
+	}
+
 	err := rollbackTransaction(t.handle)
 	if err == nil {
 		t.conn.currentTransaction = nil
-		t.conn.AutoCommit()
 	}
 	return err
 }

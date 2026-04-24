@@ -407,19 +407,9 @@ func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		}
 	}
 
-	s := makeStmt(c, "begin transaction", EXEC)
-	rows, err := s.runQuery(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	err = rows.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	c.currentTransaction = s.transaction
-	return s.transaction, nil
+	tx := &OpenAPITransaction{conn: c, handle: nil, autocommit: false}
+	c.currentTransaction = tx
+	return tx, nil
 }
 
 func (c *OpenAPIConn) DisableAutoCommit() error {
@@ -623,6 +613,9 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	s.transaction = &OpenAPITransaction{
 		handle: queryParm.qy_tranHandle,
 		conn:   s.conn,
+	}
+	if s.conn.currentTransaction != nil {
+		s.conn.currentTransaction.handle = queryParm.qy_tranHandle
 	}
 
 	if len(s.args) > 0 {
