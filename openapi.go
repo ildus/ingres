@@ -588,6 +588,7 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	queryParm.qy_connHandle = s.conn.handle
 	queryParm.qy_queryType = C.uint(s.queryType)
 	queryParm.qy_queryText = C.CString(s.query)
+	defer C.free(unsafe.Pointer(queryParm.qy_queryText))
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
 	queryParm.qy_stmtHandle = nil
@@ -608,6 +609,7 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 		stmt:               s,
 		transactionCreated: transHandle == nil,
 		stmtHandle:         stmtHandle,
+		queryType:          s.queryType,
 	}
 
 	s.transaction = &OpenAPITransaction{
@@ -1013,12 +1015,40 @@ func closeStmt(stmtHandle C.II_PTR) error {
 		C.IIapi_close(&closeParm)
 		wait(&closeParm.cl_genParm)
 		err := checkError("IIapi_close()", &closeParm.cl_genParm)
+		if err != nil {
+			msg := err.Error()
+			if strings.Contains(msg, "Operation interrupted.") || strings.Contains(msg, "Query cancelled.") {
+				return nil
+			}
+		}
 
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func cancelStmt(stmtHandle C.II_PTR) error {
+	if stmtHandle == nil {
+		return nil
+	}
+
+	var cancelParm C.IIAPI_CANCELPARM
+
+	cancelParm.cn_genParm.gp_callback = nil
+	cancelParm.cn_genParm.gp_closure = nil
+	cancelParm.cn_stmtHandle = stmtHandle
+
+	C.IIapi_cancel(&cancelParm)
+	wait(&cancelParm.cn_genParm)
+
+	err := checkError("IIapi_cancel()", &cancelParm.cn_genParm)
+	if err != nil && strings.Contains(err.Error(), "Query cancelled.") {
+		return nil
+	}
+
+	return err
 }
 
 func (s *stmt) Close() error {
@@ -1044,6 +1074,19 @@ func (b colGetBlocks) free() {
 func (rs *rows) Close() error {
 	if finish := rs.finish; finish != nil {
 		defer finish()
+	}
+
+	if rs.stmtHandle != nil && rs.queryType != EXEC && !rs.done {
+		for !rs.done {
+			err := rs.fetchData()
+			if err != nil {
+				cancelErr := cancelStmt(rs.stmtHandle)
+				if cancelErr != nil {
+					return cancelErr
+				}
+				break
+			}
+		}
 	}
 
 	err := closeStmt(rs.stmtHandle)
@@ -1154,8 +1197,6 @@ func (rs *rows) fetchInfo() error {
 
 	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
-		rs.Close()
-
 		return err
 	}
 

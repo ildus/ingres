@@ -149,6 +149,31 @@ func TestFetch(t *testing.T) {
 
 }
 
+func TestTxQueryRowLoop(t *testing.T) {
+	db, err := sql.Open("ingres", testDBName)
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		tx, err := db.Begin()
+		require.NoErrorf(t, err, "begin failed at iteration %d", i)
+
+		var reltid int32
+		err = tx.QueryRow("select reltid from iirelation").Scan(&reltid)
+		if err != nil {
+			_ = tx.Rollback()
+		}
+		require.NoErrorf(t, err, "query row failed at iteration %d", i)
+
+		err = tx.Commit()
+		require.NoErrorf(t, err, "commit failed at iteration %d", i)
+	}
+}
+
 func TestDecode(t *testing.T) {
 	conn, deinit := testconn(t)
 	defer deinit()

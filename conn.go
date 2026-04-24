@@ -162,9 +162,17 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
 
 	err = rows.fetchInfo()
+	if err != nil {
+		_ = rows.Close()
+		if autocommitMode && isBadConnError(err) {
+			return nil, driver.ErrBadConn
+		}
+		return nil, err
+	}
+
+	err = rows.Close()
 	if err != nil {
 		if autocommitMode && isBadConnError(err) {
 			return nil, driver.ErrBadConn
