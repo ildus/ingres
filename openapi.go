@@ -279,6 +279,10 @@ func ReleaseOpenAPI(env *OpenAPIEnv) {
 }
 
 func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
+	return env.ConnectContext(context.Background(), params)
+}
+
+func (env *OpenAPIEnv) ConnectContext(ctx context.Context, params ConnParams) (*OpenAPIConn, error) {
 	var connParm C.IIAPI_CONNPARM
 
 	connParm.co_genParm.gp_callback = nil
@@ -303,8 +307,38 @@ func (env *OpenAPIEnv) Connect(params ConnParams) (*OpenAPIConn, error) {
 	}
 
 	C.IIapi_connect(&connParm)
-	wait(&connParm.co_genParm)
-	err := checkError("IIapi_connect()", &connParm.co_genParm)
+	abortRequested := false
+	err := waitContext(ctx, &connParm.co_genParm, func() {
+		if abortRequested {
+			return
+		}
+		abortRequested = true
+		if connParm.co_connHandle == nil || connParm.co_connHandle == env.handle {
+			return
+		}
+
+		var abortParm C.IIAPI_ABORTPARM
+		abortParm.ab_genParm.gp_callback = nil
+		abortParm.ab_genParm.gp_closure = nil
+		abortParm.ab_connHandle = connParm.co_connHandle
+
+		C.IIapi_abort(&abortParm)
+		wait(&abortParm.ab_genParm)
+	})
+	if err != nil {
+		if connParm.co_connHandle != nil && connParm.co_connHandle != env.handle {
+			var abortParm C.IIAPI_ABORTPARM
+
+			abortParm.ab_genParm.gp_callback = nil
+			abortParm.ab_genParm.gp_closure = nil
+			abortParm.ab_connHandle = connParm.co_connHandle
+
+			C.IIapi_abort(&abortParm)
+			wait(&abortParm.ab_genParm)
+		}
+		return nil, err
+	}
+	err = checkError("IIapi_connect()", &connParm.co_genParm)
 
 	if connParm.co_genParm.gp_status == C.IIAPI_ST_SUCCESS {
 		return &OpenAPIConn{
@@ -355,6 +389,10 @@ func disconnect(c *OpenAPIConn) error {
 }
 
 func autoCommit(connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
+	return autoCommitContext(context.Background(), connHandle, transHandle)
+}
+
+func autoCommitContext(ctx context.Context, connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
 	var autoParm C.IIAPI_AUTOPARM
 
 	autoParm.ac_genParm.gp_callback = nil
@@ -363,7 +401,10 @@ func autoCommit(connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
 	autoParm.ac_tranHandle = transHandle
 
 	C.IIapi_autocommit(&autoParm)
-	wait(&autoParm.ac_genParm)
+	err := waitContext(ctx, &autoParm.ac_genParm, nil)
+	if err != nil {
+		return autoParm.ac_tranHandle, err
+	}
 
 	/*
 	 ** Check and return results.
@@ -372,20 +413,24 @@ func autoCommit(connHandle C.II_PTR, transHandle C.II_PTR) (C.II_PTR, error) {
 	 ** handle returned must be freed by disabling autocommit.
 	 ** This is done with a extra call to this routine.
 	 */
-	err := checkError("IIapi_autocommit()", &autoParm.ac_genParm)
+	err = checkError("IIapi_autocommit()", &autoParm.ac_genParm)
 	return autoParm.ac_tranHandle, err
 }
 
 func (c *OpenAPIConn) AutoCommit() error {
+	return c.AutoCommitContext(context.Background())
+}
+
+func (c *OpenAPIConn) AutoCommitContext(ctx context.Context) error {
 	if c.currentTransaction != nil {
 		return errors.New("can't enable autocommit with active transactions")
 	}
 
-	handle, err := autoCommit(c.handle, nil)
+	handle, err := autoCommitContext(ctx, c.handle, nil)
 	if err != nil {
 		if handle != nil {
 			var nullHandle C.II_PTR = nil
-			autoCommit(nullHandle, handle)
+			autoCommitContext(context.Background(), nullHandle, handle)
 		}
 		return err
 	}
@@ -408,7 +453,11 @@ func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 	}
 
 	s := makeStmt(c, "begin transaction", EXEC)
-	rows, err := s.runQuery(nil)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.runQuery(ctx, nil)
 	if err != nil {
 		if isBadConnError(err) {
 			return nil, driver.ErrBadConn
@@ -416,16 +465,16 @@ func (c *OpenAPIConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		return nil, err
 	}
 
-	err = rows.fetchInfo()
+	err = rows.fetchInfoContext(ctx)
 	if err != nil {
-		_ = rows.Close()
+		_ = rows.CloseContext(context.Background())
 		if isBadConnError(err) {
 			return nil, driver.ErrBadConn
 		}
 		return nil, err
 	}
 
-	err = rows.Close()
+	err = rows.CloseContext(ctx)
 	if err != nil {
 		if isBadConnError(err) {
 			return nil, driver.ErrBadConn
@@ -455,9 +504,23 @@ func (c *OpenAPIConn) DisableAutoCommit() error {
 
 // Wait a command to complete
 func wait(genParm *C.IIAPI_GENPARM) {
+	_ = waitContext(context.Background(), genParm, nil)
+}
+
+func waitContext(ctx context.Context, genParm *C.IIAPI_GENPARM, onCancel func()) error {
 	var waitParm C.IIAPI_WAITPARM
+	cancelRequested := false
 
 	for genParm.gp_completed == 0 {
+		if !cancelRequested && ctx != nil {
+			if err := ctx.Err(); err != nil {
+				cancelRequested = true
+				if onCancel != nil {
+					onCancel()
+				}
+			}
+		}
+
 		waitParm.wt_timeout = 100
 		C.IIapi_wait(&waitParm)
 
@@ -466,6 +529,14 @@ func wait(genParm *C.IIAPI_GENPARM) {
 			break
 		}
 	}
+
+	if cancelRequested && ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
@@ -517,7 +588,7 @@ func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
 	return resval
 }
 
-func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
+func (s *stmt) sendArgs(ctx context.Context, stmtHandle C.II_PTR) error {
 	var err error
 	var cols *C.IIAPI_DATAVALUE
 	var descs *C.IIAPI_DESCRIPTOR
@@ -570,7 +641,12 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 	}
 
 	C.IIapi_setDescriptor(&descrParm)
-	wait(&descrParm.sd_genParm)
+	err = waitContext(ctx, &descrParm.sd_genParm, func() {
+		_ = cancelStmt(stmtHandle)
+	})
+	if err != nil {
+		return err
+	}
 	err = checkError("IIapi_setDescriptor()", &descrParm.sd_genParm)
 	if err != nil {
 		return err
@@ -585,7 +661,12 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 	putParm.pp_moreSegments = 0
 
 	C.IIapi_putParms(&putParm)
-	wait(&putParm.pp_genParm)
+	err = waitContext(ctx, &putParm.pp_genParm, func() {
+		_ = cancelStmt(stmtHandle)
+	})
+	if err != nil {
+		return err
+	}
 	err = checkError("IIapi_putParms()", &putParm.pp_genParm)
 	if err != nil {
 		return err
@@ -594,7 +675,7 @@ func (s *stmt) sendArgs(stmtHandle C.II_PTR) error {
 	return nil
 }
 
-func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
+func (s *stmt) runQuery(ctx context.Context, transHandle C.II_PTR) (*rows, error) {
 	var err error
 	var stmtHandle C.II_PTR
 	var colBlocks colGetBlocks
@@ -624,7 +705,14 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	}
 
 	C.IIapi_query(&queryParm)
-	wait(&queryParm.qy_genParm)
+	err = waitContext(ctx, &queryParm.qy_genParm, func() {
+		if queryParm.qy_stmtHandle != nil {
+			_ = cancelStmt(queryParm.qy_stmtHandle)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
 	err = checkError("IIapi_query()", &queryParm.qy_genParm)
 	if err != nil {
 		return nil, err
@@ -652,7 +740,7 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 	}
 
 	if len(s.args) > 0 {
-		err = s.sendArgs(res.stmtHandle)
+		err = s.sendArgs(ctx, res.stmtHandle)
 		if err != nil {
 			return nil, err
 		}
@@ -669,7 +757,12 @@ func (s *stmt) runQuery(transHandle C.II_PTR) (*rows, error) {
 		getDescrParm.gd_descriptor = nil
 
 		C.IIapi_getDescriptor(&getDescrParm)
-		wait(&getDescrParm.gd_genParm)
+		err = waitContext(ctx, &getDescrParm.gd_genParm, func() {
+			_ = cancelStmt(res.stmtHandle)
+		})
+		if err != nil {
+			return nil, err
+		}
 
 		err = checkError("IIapi_getDescriptor()", &getDescrParm.gd_genParm)
 		if err != nil {
@@ -1036,6 +1129,10 @@ func (c *columnDesc) Length() (int64, bool) {
 }
 
 func closeStmt(stmtHandle C.II_PTR) error {
+	return closeStmtContext(context.Background(), stmtHandle)
+}
+
+func closeStmtContext(ctx context.Context, stmtHandle C.II_PTR) error {
 	if stmtHandle != nil {
 		runClose := func() error {
 			var closeParm C.IIAPI_CLOSEPARM
@@ -1045,7 +1142,12 @@ func closeStmt(stmtHandle C.II_PTR) error {
 			closeParm.cl_stmtHandle = stmtHandle
 
 			C.IIapi_close(&closeParm)
-			wait(&closeParm.cl_genParm)
+			err := waitContext(ctx, &closeParm.cl_genParm, func() {
+				_ = cancelStmt(stmtHandle)
+			})
+			if err != nil {
+				return err
+			}
 			return checkError("IIapi_close()", &closeParm.cl_genParm)
 		}
 
@@ -1108,13 +1210,17 @@ func (b colGetBlocks) free() {
 }
 
 func (rs *rows) Close() error {
+	return rs.CloseContext(context.Background())
+}
+
+func (rs *rows) CloseContext(ctx context.Context) error {
 	if finish := rs.finish; finish != nil {
 		defer finish()
 	}
 
 	if rs.stmtHandle != nil && rs.queryType != EXEC && !rs.done {
 		for !rs.done {
-			err := rs.fetchData()
+			err := rs.fetchDataContext(ctx)
 			if err != nil {
 				cancelErr := cancelStmt(rs.stmtHandle)
 				if cancelErr != nil {
@@ -1125,7 +1231,7 @@ func (rs *rows) Close() error {
 		}
 	}
 
-	err := closeStmt(rs.stmtHandle)
+	err := closeStmtContext(ctx, rs.stmtHandle)
 	if err != nil {
 		return err
 	}
@@ -1139,6 +1245,10 @@ func (rs *rows) Close() error {
 
 // Gets a new row
 func (rs *rows) fetchData() error {
+	return rs.fetchDataContext(context.Background())
+}
+
+func (rs *rows) fetchDataContext(ctx context.Context) error {
 	var err error
 	var getColParm C.IIAPI_GETCOLPARM
 
@@ -1167,7 +1277,12 @@ func (rs *rows) fetchData() error {
 			getColParm.gc_moreSegments = 0
 
 			C.IIapi_getColumns(&getColParm)
-			wait(&getColParm.gc_genParm)
+			err = waitContext(ctx, &getColParm.gc_genParm, func() {
+				_ = cancelStmt(rs.stmtHandle)
+			})
+			if err != nil {
+				return err
+			}
 			err = checkError("IIapi_getColumns()", &getColParm.gc_genParm)
 
 			if err != nil {
@@ -1204,15 +1319,18 @@ func (rs *rows) fetchData() error {
 	}
 
 	if rs.done {
-		err = rs.fetchInfo()
+		err = rs.fetchInfoContext(ctx)
 	}
 
 	return err
 }
 
 func (rs *rows) fetchInfo() error {
+	return rs.fetchInfoContext(context.Background())
+}
+
+func (rs *rows) fetchInfoContext(ctx context.Context) error {
 	var getQInfoParm C.IIAPI_GETQINFOPARM
-	var waitParm C.IIAPI_WAITPARM
 
 	/* Get fetch result info */
 	if rs.stmtHandle == nil {
@@ -1225,13 +1343,14 @@ func (rs *rows) fetchInfo() error {
 
 	info := &getQInfoParm
 	C.IIapi_getQueryInfo(info)
-
-	waitParm.wt_timeout = -1
-	for info.gq_genParm.gp_completed == 0 {
-		C.IIapi_wait(&waitParm)
+	err := waitContext(ctx, &info.gq_genParm, func() {
+		_ = cancelStmt(rs.stmtHandle)
+	})
+	if err != nil {
+		return err
 	}
 
-	err := checkError("IIapi_getQueryInfo()", &info.gq_genParm)
+	err = checkError("IIapi_getQueryInfo()", &info.gq_genParm)
 	if err != nil {
 		return err
 	}

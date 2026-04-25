@@ -1,14 +1,19 @@
 package ingres
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"io"
-	"testing"
 )
 
 var testDBName = func() string {
@@ -172,6 +177,174 @@ func TestTxQueryRowLoop(t *testing.T) {
 		err = tx.Commit()
 		require.NoErrorf(t, err, "commit failed at iteration %d", i)
 	}
+}
+
+func TestCommitWithActiveRowsReturnsStateError(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+
+	rows, err := conn.Query("select reltid from iirelation", nil)
+	require.NoError(t, err)
+
+	dest := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(dest)
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.Error(t, err)
+
+	var ingErr *IngresError
+	require.True(t, errors.As(err, &ingErr))
+	assert.Equal(t, "25000", ingErr.State)
+	assert.Contains(t, ingErr.Error(), "active queries")
+
+	require.NoError(t, rows.Close())
+	require.NoError(t, tx.Commit())
+}
+
+func TestTxEarlyCloseLoop(t *testing.T) {
+	db, err := sql.Open("ingres", testDBName)
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	const iterations = 300
+	for i := 0; i < iterations; i++ {
+		tx, err := db.Begin()
+		require.NoErrorf(t, err, "begin failed at iteration %d", i)
+
+		rows, err := tx.Query("select reltid from iirelation")
+		require.NoErrorf(t, err, "query failed at iteration %d", i)
+
+		if rows.Next() {
+			var reltid int32
+			err = rows.Scan(&reltid)
+			require.NoErrorf(t, err, "scan failed at iteration %d", i)
+		}
+		require.NoErrorf(t, rows.Close(), "rows close failed at iteration %d", i)
+
+		err = tx.Commit()
+		require.NoErrorf(t, err, "commit failed at iteration %d", i)
+	}
+}
+
+func TestConcurrentTxMultiConnStress(t *testing.T) {
+	db, err := sql.Open("ingres", testDBName)
+	require.NoError(t, err)
+	defer db.Close()
+
+	const workers = 6
+	const iterationsPerWorker = 40
+
+	db.SetMaxOpenConns(workers)
+	db.SetMaxIdleConns(workers)
+
+	var wg sync.WaitGroup
+	var stopped atomic.Bool
+	errCh := make(chan error, 1)
+
+	reportErr := func(err error) {
+		if err == nil || stopped.Load() {
+			return
+		}
+		if stopped.CompareAndSwap(false, true) {
+			errCh <- err
+		}
+	}
+
+	for worker := 0; worker < workers; worker++ {
+		workerID := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for i := 0; i < iterationsPerWorker && !stopped.Load(); i++ {
+				tx, err := db.Begin()
+				if err != nil {
+					reportErr(fmt.Errorf("worker %d begin iter %d: %w", workerID, i, err))
+					return
+				}
+
+				rows, err := tx.Query("select reltid from iirelation")
+				if err != nil {
+					_ = tx.Rollback()
+					reportErr(fmt.Errorf("worker %d query iter %d: %w", workerID, i, err))
+					return
+				}
+
+				if rows.Next() {
+					var reltid int32
+					err = rows.Scan(&reltid)
+					if err != nil {
+						_ = rows.Close()
+						_ = tx.Rollback()
+						reportErr(fmt.Errorf("worker %d scan iter %d: %w", workerID, i, err))
+						return
+					}
+				}
+
+				err = rows.Close()
+				if err != nil {
+					_ = tx.Rollback()
+					reportErr(fmt.Errorf("worker %d close iter %d: %w", workerID, i, err))
+					return
+				}
+
+				err = tx.Commit()
+				if err != nil {
+					reportErr(fmt.Errorf("worker %d commit iter %d: %w", workerID, i, err))
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	default:
+	}
+}
+
+func TestBeginTxContextCanceled(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := conn.BeginTx(ctx, driver.TxOptions{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestStmtQueryContextCanceled(t *testing.T) {
+	conn, deinit := testconn(t)
+	defer deinit()
+
+	s := makeStmt(conn, "select reltid from iirelation", QUERY)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.QueryContext(ctx, nil)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestConnectorConnectContextCanceled(t *testing.T) {
+	d := Driver{}
+	connector, err := d.OpenConnector(testDBName)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = connector.Connect(ctx)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestDecode(t *testing.T) {
