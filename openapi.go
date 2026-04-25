@@ -458,10 +458,10 @@ func wait(genParm *C.IIAPI_GENPARM) {
 	var waitParm C.IIAPI_WAITPARM
 
 	for genParm.gp_completed == 0 {
-		waitParm.wt_timeout = -1
+		waitParm.wt_timeout = 100
 		C.IIapi_wait(&waitParm)
 
-		if waitParm.wt_status != C.IIAPI_ST_SUCCESS {
+		if waitParm.wt_status != C.IIAPI_ST_SUCCESS && waitParm.wt_status != C.IIAPI_ST_WARNING {
 			genParm.gp_status = waitParm.wt_status
 			break
 		}
