@@ -511,9 +511,10 @@ func wait(genParm *C.IIAPI_GENPARM) {
 func waitContext(ctx context.Context, genParm *C.IIAPI_GENPARM, onCancel func()) error {
 	var waitParm C.IIAPI_WAITPARM
 	cancelRequested := false
+	blockingWait := ctx == nil || ctx.Done() == nil
 
 	for genParm.gp_completed == 0 {
-		if !cancelRequested && ctx != nil {
+		if !blockingWait && !cancelRequested && ctx != nil {
 			if err := ctx.Err(); err != nil {
 				cancelRequested = true
 				if onCancel != nil {
@@ -522,7 +523,11 @@ func waitContext(ctx context.Context, genParm *C.IIAPI_GENPARM, onCancel func())
 			}
 		}
 
-		waitParm.wt_timeout = 100
+		if blockingWait {
+			waitParm.wt_timeout = -1
+		} else {
+			waitParm.wt_timeout = 100
+		}
 		C.IIapi_wait(&waitParm)
 
 		if waitParm.wt_status != C.IIAPI_ST_SUCCESS && waitParm.wt_status != C.IIAPI_ST_WARNING {
