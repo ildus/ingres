@@ -691,17 +691,17 @@ func TestArgs(t *testing.T) {
      )`)
 	require.NoError(t, err)
 
-	res, err := conn.Exec(`insert into test_args values ( ~V , ~V , ~V , ~V , ~V )`,
-        1, "aaa", 2, 0.1, 0.2)
+	res, err := conn.Exec("insert into test_args values (1, 'aaa', 2, 0.1, 0.2)")
 	require.NoError(t, err)
 
 	stmt, err := conn.Prepare(`insert into test_args values ( ~V , ~V , ~V , ~V , ~V )`)
 	require.NoError(t, err)
+	defer stmt.Close()
 
-    res, err = stmt.Exec(3, "bbb", 4, 1.1, 2.2)
+	res, err = stmt.Exec(3, "bbb", 4, 1.1, 2.2)
 	require.NoError(t, err)
 
-    res, err = stmt.Exec(3, "ccc", 4, 3.3, 4.4)
+	res, err = stmt.Exec(3, "ccc", 4, 3.3, 4.4)
 	require.NoError(t, err)
 
 	cnt, err := res.RowsAffected()

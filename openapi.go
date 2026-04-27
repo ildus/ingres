@@ -115,6 +115,7 @@ import (
 	"log"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -588,6 +589,62 @@ func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
 	return resval
 }
 
+func formatSQLLiteral(v driver.Value) (string, error) {
+	if v == nil {
+		return "null", nil
+	}
+
+	switch x := v.(type) {
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'", nil
+	case []byte:
+		return "'" + strings.ReplaceAll(string(x), "'", "''") + "'", nil
+	case int:
+		return strconv.Itoa(x), nil
+	case int8:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int16:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int32:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+	case float32:
+		return strconv.FormatFloat(float64(x), 'g', -1, 32), nil
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64), nil
+	case bool:
+		if x {
+			return "true", nil
+		}
+		return "false", nil
+	default:
+		return "", fmt.Errorf("unsupported SQL literal type %T", v)
+	}
+}
+
+func inlineTildeArgs(query string, args []driver.Value) (string, error) {
+	out := query
+	for _, arg := range args {
+		idx := strings.Index(out, "~V")
+		if idx < 0 {
+			return "", errors.New("more args provided than ~V placeholders")
+		}
+
+		lit, err := formatSQLLiteral(arg)
+		if err != nil {
+			return "", err
+		}
+		out = out[:idx] + lit + out[idx+2:]
+	}
+
+	if strings.Contains(out, "~V") {
+		return "", errors.New("not enough args for ~V placeholders")
+	}
+
+	return out, nil
+}
+
 func (s *stmt) sendArgs(ctx context.Context, stmtHandle C.II_PTR) error {
 	var err error
 	var cols *C.IIAPI_DATAVALUE
@@ -689,18 +746,30 @@ func (s *stmt) runQuery(ctx context.Context, transHandle C.II_PTR) (*rows, error
 
 	var queryParm C.IIAPI_QUERYPARM
 	var getDescrParm C.IIAPI_GETDESCRPARM
+	queryText := s.query
+	sendArgs := len(s.args) > 0
+
+	if sendArgs && strings.Contains(queryText, "~V") {
+		inlinedQuery, inlineErr := inlineTildeArgs(queryText, s.args)
+		if inlineErr != nil {
+			return nil, inlineErr
+		}
+		queryText = inlinedQuery
+		sendArgs = false
+		s.args = nil
+	}
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = s.conn.handle
 	queryParm.qy_queryType = C.uint(s.queryType)
-	queryParm.qy_queryText = C.CString(s.query)
+	queryParm.qy_queryText = C.CString(queryText)
 	defer C.free(unsafe.Pointer(queryParm.qy_queryText))
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
 	queryParm.qy_stmtHandle = nil
 
-	if len(s.args) > 0 {
+	if sendArgs {
 		queryParm.qy_parameters = 1
 	}
 
@@ -739,7 +808,7 @@ func (s *stmt) runQuery(ctx context.Context, transHandle C.II_PTR) (*rows, error
 		s.conn.currentTransaction.handle = nextTranHandle
 	}
 
-	if len(s.args) > 0 {
+	if sendArgs {
 		err = s.sendArgs(ctx, res.stmtHandle)
 		if err != nil {
 			return nil, err
