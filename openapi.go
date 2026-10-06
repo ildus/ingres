@@ -116,7 +116,6 @@ import (
 	"math"
 	"reflect"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -202,7 +201,6 @@ type rows struct {
 	*/
 	colBlocks colGetBlocks
 
-	lastInsertId int64
 	rowsAffected int64
 }
 
@@ -291,16 +289,31 @@ func (env *OpenAPIEnv) ConnectContext(ctx context.Context, params ConnParams) (*
 	connParm.co_genParm.gp_callback = nil
 	connParm.co_genParm.gp_closure = nil
 	connParm.co_type = C.IIAPI_CT_SQL
-	connParm.co_target = C.CString(params.DbName)
+	target, err := cString(params.DbName)
+	if err != nil {
+		return nil, fmt.Errorf("database name: %w", err)
+	}
+	defer C.free(unsafe.Pointer(target))
+	connParm.co_target = target
 	connParm.co_connHandle = env.handle
 	connParm.co_tranHandle = nil
 	connParm.co_username = nil
 	connParm.co_password = nil
 	if len(params.UserName) > 0 {
-		connParm.co_username = C.CString(params.UserName)
+		username, err := cString(params.UserName)
+		if err != nil {
+			return nil, fmt.Errorf("username: %w", err)
+		}
+		defer C.free(unsafe.Pointer(username))
+		connParm.co_username = username
 	}
 	if len(params.Password) > 0 {
-		connParm.co_password = C.CString(params.Password)
+		password, err := cString(params.Password)
+		if err != nil {
+			return nil, fmt.Errorf("password: %w", err)
+		}
+		defer C.free(unsafe.Pointer(password))
+		connParm.co_password = password
 	}
 
 	if params.Timeout > 0 {
@@ -311,7 +324,7 @@ func (env *OpenAPIEnv) ConnectContext(ctx context.Context, params ConnParams) (*
 
 	C.IIapi_connect(&connParm)
 	abortRequested := false
-	err := waitContext(ctx, &connParm.co_genParm, func() {
+	err = waitContext(ctx, &connParm.co_genParm, func() {
 		if abortRequested {
 			return
 		}
@@ -547,109 +560,92 @@ func waitContext(ctx context.Context, genParm *C.IIAPI_GENPARM, onCancel func())
 	return nil
 }
 
-func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) []byte {
-	var resval []byte
+// cString allocates a C string. The caller frees it. A NUL byte would
+// truncate the value at the C boundary, so it is rejected.
+func cString(s string) (*C.char, error) {
+	if strings.IndexByte(s, 0) >= 0 {
+		return nil, errors.New("string contains a NUL byte")
+	}
+	return C.CString(s), nil
+}
 
+func int64Param(v int64) []byte {
+	buf := make([]byte, 8)
+	nativeEndian.PutUint64(buf, uint64(v))
+	return buf
+}
+
+func fillDesc(desc *C.IIAPI_DESCRIPTOR, val driver.Value) (data []byte, isNull bool, err error) {
 	desc.ds_columnType = C.IIAPI_COL_QPARM
 	desc.ds_columnName = nil
 	desc.ds_nullable = 0
 	desc.ds_precision = 0
 	desc.ds_scale = 0
 
-	switch val.(type) {
-	case string:
-		resval = []byte(val.(string))
+	if val == nil {
+		desc.ds_nullable = 1
 		desc.ds_dataType = C.IIAPI_CHA_TYPE
+		desc.ds_length = 0
+		return nil, true, nil
+	}
 
-	case int8, int16, int32, int64:
-		var val64 uint64
-
-		switch val.(type) {
-		case int8:
-			val64 = uint64(val.(int8))
-		case int16:
-			val64 = uint64(val.(int16))
-		case int32:
-			val64 = uint64(val.(int32))
-		case int64:
-			val64 = uint64(val.(int64))
+	switch v := val.(type) {
+	case string:
+		data = []byte(v)
+		desc.ds_dataType = C.IIAPI_CHA_TYPE
+	case []byte:
+		data = v
+		desc.ds_dataType = C.IIAPI_BYTE_TYPE
+	case bool:
+		if v {
+			data = []byte{1}
+		} else {
+			data = []byte{0}
 		}
-		resval = make([]byte, 8)
-		nativeEndian.PutUint64(resval, val64)
-
+		desc.ds_dataType = C.IIAPI_BOOL_TYPE
+	case int:
+		data = int64Param(int64(v))
+		desc.ds_dataType = C.IIAPI_INT_TYPE
+	case int8:
+		data = int64Param(int64(v))
+		desc.ds_dataType = C.IIAPI_INT_TYPE
+	case int16:
+		data = int64Param(int64(v))
+		desc.ds_dataType = C.IIAPI_INT_TYPE
+	case int32:
+		data = int64Param(int64(v))
+		desc.ds_dataType = C.IIAPI_INT_TYPE
+	case int64:
+		data = int64Param(v)
 		desc.ds_dataType = C.IIAPI_INT_TYPE
 	case float32:
-		resval = make([]byte, 4)
-		nativeEndian.PutUint32(resval, math.Float32bits(val.(float32)))
-
+		data = make([]byte, 4)
+		nativeEndian.PutUint32(data, math.Float32bits(v))
 		desc.ds_dataType = C.IIAPI_FLT_TYPE
 	case float64:
-		resval = make([]byte, 8)
-		nativeEndian.PutUint64(resval, math.Float64bits(val.(float64)))
-
+		data = make([]byte, 8)
+		nativeEndian.PutUint64(data, math.Float64bits(v))
 		desc.ds_dataType = C.IIAPI_FLT_TYPE
+	case time.Time:
+		data = []byte(v.Format("2006-01-02 15:04:05.999999"))
+		desc.ds_dataType = C.IIAPI_CHA_TYPE
 	default:
+		return nil, false, fmt.Errorf("unsupported parameter type %T", val)
+	}
+
+	if len(data) > 0xFFFF {
+		return nil, false, errors.New("parameter exceeds maximum length")
+	}
+	desc.ds_length = C.uint16_t(len(data))
+	return data, false, nil
+}
+
+func validatePlaceholders(query string, nargs int) error {
+	n := strings.Count(query, "~V")
+	if n == 0 || n == nargs {
 		return nil
 	}
-
-	desc.ds_length = C.uint16_t(len(resval))
-	return resval
-}
-
-func formatSQLLiteral(v driver.Value) (string, error) {
-	if v == nil {
-		return "null", nil
-	}
-
-	switch x := v.(type) {
-	case string:
-		return "'" + strings.ReplaceAll(x, "'", "''") + "'", nil
-	case []byte:
-		return "'" + strings.ReplaceAll(string(x), "'", "''") + "'", nil
-	case int:
-		return strconv.Itoa(x), nil
-	case int8:
-		return strconv.FormatInt(int64(x), 10), nil
-	case int16:
-		return strconv.FormatInt(int64(x), 10), nil
-	case int32:
-		return strconv.FormatInt(int64(x), 10), nil
-	case int64:
-		return strconv.FormatInt(x, 10), nil
-	case float32:
-		return strconv.FormatFloat(float64(x), 'g', -1, 32), nil
-	case float64:
-		return strconv.FormatFloat(x, 'g', -1, 64), nil
-	case bool:
-		if x {
-			return "true", nil
-		}
-		return "false", nil
-	default:
-		return "", fmt.Errorf("unsupported SQL literal type %T", v)
-	}
-}
-
-func inlineTildeArgs(query string, args []driver.Value) (string, error) {
-	out := query
-	for _, arg := range args {
-		idx := strings.Index(out, "~V")
-		if idx < 0 {
-			return "", errors.New("more args provided than ~V placeholders")
-		}
-
-		lit, err := formatSQLLiteral(arg)
-		if err != nil {
-			return "", err
-		}
-		out = out[:idx] + lit + out[idx+2:]
-	}
-
-	if strings.Contains(out, "~V") {
-		return "", errors.New("not enough args for ~V placeholders")
-	}
-
-	return out, nil
+	return fmt.Errorf("%d ~V placeholders for %d arguments", n, nargs)
 }
 
 // pinBytes pins b's backing array and returns its address. C may keep that
@@ -702,15 +698,19 @@ func (s *stmt) sendArgs(ctx context.Context, stmtHandle C.II_PTR) error {
 	vals = make([][]byte, len(args))
 
 	for i, arg := range args {
-		val := fillDesc(C.get_desc(descs, C.ushort(i)), arg)
-		if val == nil {
-			return errors.New("parameter conversion error")
+		val, isNull, convErr := fillDesc(C.get_desc(descs, C.ushort(i)), arg)
+		if convErr != nil {
+			return convErr
 		}
 
 		vals[i] = val
 		C.set_dv_value(cols, C.int(i), pinBytes(&pins, vals[i]))
 		C.set_dv_length(cols, C.int(i), C.ushort(len(val)))
-		C.set_dv_null(cols, C.int(i), 0)
+		if isNull {
+			C.set_dv_null(cols, C.int(i), 1)
+		} else {
+			C.set_dv_null(cols, C.int(i), 0)
+		}
 	}
 
 	C.IIapi_setDescriptor(&descrParm)
@@ -765,21 +765,21 @@ func (s *stmt) runQuery(ctx context.Context, transHandle C.II_PTR) (*rows, error
 	queryText := s.query
 	sendArgs := len(s.args) > 0
 
-	if sendArgs && strings.Contains(queryText, "~V") {
-		inlinedQuery, inlineErr := inlineTildeArgs(queryText, s.args)
-		if inlineErr != nil {
-			return nil, inlineErr
+	if sendArgs {
+		if placeholderErr := validatePlaceholders(queryText, len(s.args)); placeholderErr != nil {
+			return nil, placeholderErr
 		}
-		queryText = inlinedQuery
-		sendArgs = false
-		s.args = nil
 	}
 
 	queryParm.qy_genParm.gp_callback = nil
 	queryParm.qy_genParm.gp_closure = nil
 	queryParm.qy_connHandle = s.conn.handle
 	queryParm.qy_queryType = C.uint(s.queryType)
-	queryParm.qy_queryText = C.CString(queryText)
+	qtext, qerr := cString(queryText)
+	if qerr != nil {
+		return nil, errors.New("query contains a NUL byte")
+	}
+	queryParm.qy_queryText = qtext
 	defer C.free(unsafe.Pointer(queryParm.qy_queryText))
 	queryParm.qy_parameters = 0
 	queryParm.qy_tranHandle = transHandle
@@ -1021,7 +1021,7 @@ func checkError(location string, genParm *C.IIAPI_GENPARM) error {
 				wrapped := fmt.Errorf("%w\n%s", err, msg)
 				err = newIngresError(state, errorCode, wrapped)
 			} else {
-				err = newIngresError(state, errorCode, fmt.Errorf(msg))
+				err = newIngresError(state, errorCode, errors.New(msg))
 			}
 		}
 	}
@@ -1046,18 +1046,40 @@ func (c *columnDesc) isLongType() bool {
 	}
 }
 
-func (c *columnDesc) splitLenVal(val []byte) (uint16, []byte) {
+func (c *columnDesc) splitLenVal(val []byte) (uint16, []byte, error) {
 	switch c.ingDataType {
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE, C.IIAPI_VBYTE_TYPE:
+		if len(val) < 2 {
+			return 0, nil, errors.New("column data is shorter than its length prefix")
+		}
 		cnt := nativeEndian.Uint16(val)
-		val = val[2:]
-		return cnt, val[:cnt]
+		if int(cnt) > len(val)-2 {
+			return 0, nil, errors.New("column length prefix exceeds data")
+		}
+		return cnt, val[2 : 2+cnt], nil
 	case C.IIAPI_NVCH_TYPE:
+		if len(val) < 2 {
+			return 0, nil, errors.New("column data is shorter than its length prefix")
+		}
 		cnt := nativeEndian.Uint16(val)
-		val = val[2:]
-		return cnt, val[:cnt*2]
+		nbytes := int(cnt) * 2
+		if nbytes > len(val)-2 {
+			return 0, nil, errors.New("column length prefix exceeds data")
+		}
+		return cnt, val[2 : 2+nbytes], nil
 	default:
-		return uint16(len(val)), val
+		return uint16(len(val)), val, nil
+	}
+}
+
+func (c *columnDesc) maxFetchSize() int {
+	switch c.ingDataType {
+	case C.IIAPI_LNVCH_TYPE:
+		return 1_000_000_000
+	case C.IIAPI_LVCH_TYPE, C.IIAPI_LTXT_TYPE, C.IIAPI_LBYTE_TYPE:
+		return 2_000_000_000
+	default:
+		return int(c.length)
 	}
 }
 
@@ -1080,12 +1102,14 @@ func (c *columnDesc) getType() reflect.Type {
 		C.IIAPI_LBYTE_TYPE:
 		return reflect.TypeOf([]byte(nil))
 	case C.IIAPI_INT_TYPE:
-		if c.length == 2 {
+		if c.length == 1 {
+			return reflect.TypeOf(int8(0))
+		} else if c.length == 2 {
 			return reflect.TypeOf(int16(0))
 		} else if c.length == 4 {
 			return reflect.TypeOf(int32(0))
 		} else if c.length == 8 {
-			return reflect.TypeOf(int32(0))
+			return reflect.TypeOf(int64(0))
 		}
 	case C.IIAPI_FLT_TYPE:
 		if c.length == 4 {
@@ -1388,13 +1412,19 @@ func (rs *rows) fetchDataContext(ctx context.Context) error {
 			}
 
 			if block.segmented {
-				// we can do this because for segmented there is only one
-				// column in colBlock
-				sz := block.cols.dv_length
-
-				// first 2 two bytes contain the size, but we need all content
+				// one column per segmented block; the first 2 bytes are the segment size
+				sz := int(block.cols.dv_length)
+				buf := rs.vals[block.colIndex]
+				if sz < 0 || sz > len(buf) {
+					return errors.New("column segment length exceeds buffer")
+				}
 				if sz > 2 {
-					block.buffer.Write(rs.vals[block.colIndex][2:sz])
+					chunk := buf[2:sz]
+					max := rs.colTyps[block.colIndex].maxFetchSize()
+					if len(chunk) > max || block.buffer.Len() > max-len(chunk) {
+						return errors.New("long column exceeds maximum size")
+					}
+					block.buffer.Write(chunk)
 				}
 			}
 
@@ -1457,13 +1487,46 @@ func shrinkStrWithBlanks(res string) string {
 	return strings.TrimRight(res, "\x00 ")
 }
 
+func needBytes(val []byte, n int) error {
+	if len(val) < n {
+		return errors.New("column data is shorter than the value width")
+	}
+	return nil
+}
+
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
+}
+
 func decode(col *columnDesc, val []byte) (driver.Value, error) {
 	var res driver.Value
 
-	_, val = col.splitLenVal(val)
+	_, val, err := col.splitLenVal(val)
+	if err != nil {
+		return nil, err
+	}
 
 	switch col.ingDataType {
 	case C.IIAPI_INT_TYPE:
+		var width int
+		switch col.length {
+		case 1:
+			width = 1
+		case 2:
+			width = 2
+		case 4:
+			width = 4
+		case 8:
+			width = 8
+		default:
+			return nil, errors.New("unsupported integer width")
+		}
+		if err = needBytes(val, width); err != nil {
+			return nil, err
+		}
 		switch col.length {
 		case 1:
 			res = int8(val[0])
@@ -1475,6 +1538,18 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 			res = int64(nativeEndian.Uint64(val))
 		}
 	case C.IIAPI_FLT_TYPE:
+		var width int
+		switch col.length {
+		case 4:
+			width = 4
+		case 8:
+			width = 8
+		default:
+			return nil, errors.New("unsupported float width")
+		}
+		if err = needBytes(val, width); err != nil {
+			return nil, err
+		}
 		switch col.length {
 		case 4:
 			bits := nativeEndian.Uint32(val)
@@ -1486,7 +1561,7 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 	case C.IIAPI_CHR_TYPE, C.IIAPI_CHA_TYPE:
 		res = shrinkStrWithBlanks(string(val))
 	case C.IIAPI_LVCH_TYPE, C.IIAPI_LTXT_TYPE:
-		if col.block == nil {
+		if col.block == nil || col.block.buffer == nil {
 			return nil, errors.New("internal: long types should have a link to column block")
 		}
 
@@ -1496,15 +1571,18 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 	case C.IIAPI_TXT_TYPE, C.IIAPI_VCH_TYPE:
 		res = shrinkStr(string(val))
 	case C.IIAPI_BOOL_TYPE:
+		if err = needBytes(val, 1); err != nil {
+			return nil, err
+		}
 		res = (val[0] == 1)
 	case C.IIAPI_VBYTE_TYPE, C.IIAPI_BYTE_TYPE:
-		res = val
+		res = cloneBytes(val)
 	case C.IIAPI_LBYTE_TYPE:
-		if col.block == nil {
+		if col.block == nil || col.block.buffer == nil {
 			return nil, errors.New("internal: long types should have a link to column block")
 		}
 
-		res = col.block.buffer.Bytes()
+		res = cloneBytes(col.block.buffer.Bytes())
 	case C.IIAPI_NVCH_TYPE, C.IIAPI_NCHA_TYPE:
 		out := make([]uint16, len(val)/2)
 		for i := range out {
@@ -1513,6 +1591,9 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		res = string(utf16.Decode(out))
 		res = shrinkStr(res.(string))
 	case C.IIAPI_LNVCH_TYPE:
+		if col.block == nil || col.block.buffer == nil {
+			return nil, errors.New("internal: long types should have a link to column block")
+		}
 		val = col.block.buffer.Bytes()
 		out := make([]uint16, len(val)/2)
 		for i := range out {
@@ -1532,8 +1613,6 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 		C.IIAPI_TSTZ_TYPE,  /* Timestamp with Timezone */
 		C.IIAPI_INTYM_TYPE, /* Interval Year to Month */
 		C.IIAPI_INTDS_TYPE: /* Interval Day to Second */
-		var err error
-
 		res, err = convertToStr(col, val)
 		if err != nil {
 			return nil, err
@@ -1547,7 +1626,12 @@ func decode(col *columnDesc, val []byte) (driver.Value, error) {
 }
 
 func convertToStr(cd *columnDesc, val []byte) (string, error) {
-	var destBuf = smallBytesPool.Get().([]byte)
+	if len(val) == 0 {
+		return "", errors.New("conversion error")
+	}
+
+	destBuf := smallBytesPool.Get().([]byte)
+	defer smallBytesPool.Put(destBuf)
 
 	status := C.convert_to_string(cd.ingDataType, C.II_PTR(&val[0]), C.ushort(len(val)),
 		C.II_PTR(&destBuf[0]), C.ushort(len(destBuf)))
@@ -1556,10 +1640,7 @@ func convertToStr(cd *columnDesc, val []byte) (string, error) {
 		return "", errors.New("conversion error")
 	}
 
-	res := string(destBuf)
-	smallBytesPool.Put(destBuf)
-
-	return res, nil
+	return string(destBuf), nil
 }
 
 func (rs *rows) Next(dest []driver.Value) (err error) {

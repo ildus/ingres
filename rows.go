@@ -5,6 +5,7 @@ package ingres
 */
 import "C"
 import (
+	"errors"
 	"fmt"
 	"reflect"
 )
@@ -50,7 +51,7 @@ func (rs *rows) Columns() []string {
 }
 
 func (rs rows) LastInsertId() (int64, error) {
-	return rs.lastInsertId, nil
+	return 0, errors.New("last insert id is not supported")
 }
 
 func (rs rows) RowsAffected() (int64, error) {
