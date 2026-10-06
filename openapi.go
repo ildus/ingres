@@ -115,6 +115,7 @@ import (
 	"log"
 	"math"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,7 +170,7 @@ type colBlock struct {
 	colIndex  uint16
 	segmented bool
 	count     uint16
-	cols      *C.IIAPI_DATAVALUE // dv_value will point to vals[x] in rows.vals
+	cols      *C.IIAPI_DATAVALUE // dv_value points at pinned rows.vals buffers
 	nulls     []*bool            // items will point to nulls[x] in rows.nulls
 
 	buffer *bytes.Buffer
@@ -191,6 +192,7 @@ type rows struct {
 
 	vals  [][]byte // byte buffers where API writes results
 	nulls []bool
+	pins  runtime.Pinner // keeps vals alive while cols retains their addresses
 
 	/* if one or more of the columns is long we have to get columns by parts,
 	   for example we have 10 columns, and 5th is long varchar, then
@@ -650,25 +652,34 @@ func inlineTildeArgs(query string, args []driver.Value) (string, error) {
 	return out, nil
 }
 
+// pinBytes pins b's backing array and returns its address. C may keep that
+// address until p is unpinned. An empty slice has no bytes to retain.
+func pinBytes(p *runtime.Pinner, b []byte) unsafe.Pointer {
+	if len(b) == 0 {
+		return nil
+	}
+	p.Pin(&b[0])
+	return unsafe.Pointer(&b[0])
+}
+
 func (s *stmt) sendArgs(ctx context.Context, stmtHandle C.II_PTR) error {
 	var err error
 	var cols *C.IIAPI_DATAVALUE
 	var descs *C.IIAPI_DESCRIPTOR
 
 	var vals [][]byte
+	var pins runtime.Pinner
 
 	/* cleanup everything at the end */
 	defer func() {
+		pins.Unpin()
+
 		if cols != nil {
 			C.free(unsafe.Pointer(cols))
 		}
 
 		if descs != nil {
 			C.free(unsafe.Pointer(descs))
-		}
-
-		if vals != nil {
-			vals = nil
 		}
 	}()
 
@@ -697,7 +708,7 @@ func (s *stmt) sendArgs(ctx context.Context, stmtHandle C.II_PTR) error {
 		}
 
 		vals[i] = val
-		C.set_dv_value(cols, C.int(i), unsafe.Pointer(&vals[i][0]))
+		C.set_dv_value(cols, C.int(i), pinBytes(&pins, vals[i]))
 		C.set_dv_length(cols, C.int(i), C.ushort(len(val)))
 		C.set_dv_null(cols, C.int(i), 0)
 	}
@@ -886,8 +897,8 @@ func (s *stmt) runQuery(ctx context.Context, transHandle C.II_PTR) (*rows, error
 
 			for i = 0; i < count; i++ {
 				j := start + i
-				C.set_dv_length(block.cols, C.int(i), C.uint16_t(res.colTyps[i].length))
-				C.set_dv_value(block.cols, C.int(i), unsafe.Pointer(&res.vals[j][0]))
+				C.set_dv_length(block.cols, C.int(i), C.uint16_t(res.colTyps[j].length))
+				C.set_dv_value(block.cols, C.int(i), pinBytes(&res.pins, res.vals[j]))
 				block.nulls[i] = &res.nulls[j]
 			}
 			return block
@@ -1291,6 +1302,14 @@ func (rs *rows) CloseContext(ctx context.Context) error {
 	if finish := rs.finish; finish != nil {
 		defer finish()
 	}
+	// Release pinned column buffers on every exit. A Pinner that is
+	// collected while it still holds pins panics, and a second Close
+	// must not fetch through the freed column array.
+	defer func() {
+		rs.done = true
+		rs.pins.Unpin()
+		rs.colBlocks.free()
+	}()
 
 	if rs.stmtHandle != nil && rs.queryType != EXEC && !rs.done {
 		for !rs.done {
@@ -1310,9 +1329,6 @@ func (rs *rows) CloseContext(ctx context.Context) error {
 		return err
 	}
 	rs.stmtHandle = nil
-
-	// free C allocated arrays
-	rs.colBlocks.free()
 
 	return err
 }
